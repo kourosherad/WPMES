@@ -41,42 +41,49 @@ function sendJson(res, status, value) {
   res.end(JSON.stringify(value));
 }
 
-function publicRequest(req) {
-  const hostHeader = String(req.headers.host || '').toLowerCase();
-  const requestHost = hostHeader.startsWith('[') ? hostHeader.slice(1, hostHeader.indexOf(']')) : hostHeader.split(':')[0];
-  const isPrivateEndpoint = requestHost === '172.30.197.93' || requestHost === '127.0.0.1' || requestHost === 'localhost' || requestHost === '::1';
-  return !isPrivateEndpoint;
-}
-
 function constantTimeMatch(left, right) {
   const a = Buffer.from(String(left));
   const b = Buffer.from(String(right));
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
-function sessionValue(config, expiresAt = Date.now() + 8 * 60 * 60 * 1000) {
-  const payload = `${config.username}.${expiresAt}`;
-  const signature = createHmac('sha256', config.password).update(payload).digest('base64url');
+function authUsers(config) {
+  if (Array.isArray(config.users)) return config.users.filter((user) => user && user.username && user.password && user.role);
+  if (config.username && config.password) return [{ username: config.username, password: config.password, displayName: 'کاربر مهندسی', role: 'engineering' }];
+  return [];
+}
+
+function authSecret(config) {
+  return String(config.sessionSecret || config.password || JSON.stringify(config));
+}
+
+function sessionValue(config, user, expiresAt = Date.now() + 8 * 60 * 60 * 1000) {
+  const payload = Buffer.from(JSON.stringify({ username: user.username, role: user.role, expiresAt })).toString('base64url');
+  const signature = createHmac('sha256', authSecret(config)).update(payload).digest('base64url');
   return `${payload}.${signature}`;
 }
 
 function validSession(req, config) {
   const cookie = String(req.headers.cookie || '').split(';').map((value) => value.trim()).find((value) => value.startsWith('khatnegar_session='));
-  if (!cookie) return false;
+  if (!cookie) return null;
   const token = decodeURIComponent(cookie.slice('khatnegar_session='.length));
   const parts = token.split('.');
-  if (parts.length !== 3 || parts[0] !== config.username || !Number.isFinite(Number(parts[1])) || Number(parts[1]) < Date.now()) return false;
-  return constantTimeMatch(token, sessionValue(config, Number(parts[1])));
+  if (parts.length !== 2) return null;
+  let payload;
+  try { payload = JSON.parse(Buffer.from(parts[0], 'base64url').toString('utf8')); } catch { return null; }
+  if (!payload?.username || !payload?.role || !Number.isFinite(Number(payload.expiresAt)) || Number(payload.expiresAt) < Date.now()) return null;
+  const user = authUsers(config).find((item) => item.username === payload.username && item.role === payload.role);
+  if (!user || !constantTimeMatch(token, sessionValue(config, user, Number(payload.expiresAt)))) return null;
+  return { username: user.username, displayName: user.displayName || user.username, role: user.role };
 }
 
 function renderLogin(res, invalid = false) {
   const error = invalid ? '<p class="login-error">نام کاربری یا رمز عبور صحیح نیست.</p>' : '';
   res.writeHead(invalid ? 401 : 200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
-  res.end(`<!doctype html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ورود به خط‌نگار</title><link rel="stylesheet" href="/auth/login.css"></head><body><main class="login-shell"><section class="login-panel"><div class="brand"><span class="brand-mark"><i></i><i></i><i></i></span><span><b>خط‌نگار</b><small>سامانه کنترل تولید</small></span></div><div class="login-copy"><span>درگاه امن سامانه</span><h1>ورود به فضای عملیاتی</h1><p>برای ادامه، اطلاعات دسترسی ارائه را وارد کنید.</p></div>${error}<form method="post" action="/auth/login"><label>نام کاربری<input name="username" autocomplete="username" required autofocus></label><label>رمز عبور<input name="password" type="password" autocomplete="current-password" required></label><button type="submit"><span>ورود به سامانه</span><i>←</i></button></form><footer><span></span>اتصال رمزنگاری‌شده HTTPS<span></span></footer></section><aside class="login-visual"><div class="visual-grid"></div><div class="visual-orbit one"></div><div class="visual-orbit two"></div><div class="visual-core"><i></i><strong>01</strong><small>PHASE</small></div><div class="visual-caption"><span>PRODUCTION CONTROL SYSTEM</span><b>جریان تولید، دقیق و قابل پیگیری</b></div></aside></main></body></html>`);
+  res.end(`<!doctype html><html lang="fa" dir="rtl"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>ورود به WPMES</title><link rel="stylesheet" href="/auth/login.css"></head><body><main class="login-shell"><section class="login-panel"><div class="brand"><span class="brand-mark"><i></i><i></i><i></i></span><span><b>WPMES</b><small>Wagon Pars Manufacturing Execution System</small></span></div><div class="login-copy"><span>IDENTITY GATEWAY</span><h1>ورود به سامانه تولید</h1><p>حساب سازمانی خود را وارد کنید.</p></div>${error}<form method="post" action="/auth/login"><label>نام کاربری<input name="username" autocomplete="username" required autofocus></label><label>رمز عبور<input name="password" type="password" autocomplete="current-password" required></label><button type="submit"><span>ورود به سامانه</span><i>←</i></button></form><div class="auth-ready"><span>LDAP</span><span>LOCAL</span><span>GOOGLE WORKSPACE</span><small>آماده اتصال به سرویس هویت سازمان</small></div><footer><span></span>اتصال رمزنگاری‌شده HTTPS<span></span></footer></section><aside class="login-visual"><div class="visual-grid"></div><div class="visual-orbit one"></div><div class="visual-orbit two"></div><div class="visual-core"><i></i><strong>01</strong><small>PHASE</small></div><div class="visual-caption"><span>PRODUCTION CONTROL SYSTEM</span><b>از هویت کاربر تا ثبت عملیات</b></div></aside></main></body></html>`);
 }
 
 async function authorizePublicRequest(req, res, pathname, isSecure) {
-  if (!publicRequest(req)) return true;
   if (!existsSync(publicAuthPath)) { sendJson(res, 503, { error: 'دسترسی عمومی پیکربندی نشده است.' }); return false; }
   const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
   if (pathname === '/auth/login.css' && req.method === 'GET') {
@@ -88,16 +95,23 @@ async function authorizePublicRequest(req, res, pathname, isSecure) {
   }
   if (pathname === '/auth/login' && req.method === 'POST') {
     const form = new URLSearchParams(await readRaw(req));
-    if (constantTimeMatch(form.get('username') || '', config.username) && constantTimeMatch(form.get('password') || '', config.password)) {
+    const user = authUsers(config).find((item) => constantTimeMatch(form.get('username') || '', item.username) && constantTimeMatch(form.get('password') || '', item.password));
+    if (user) {
       const secure = isSecure ? '; Secure' : '';
-      res.writeHead(303, { 'Location': '/', 'Cache-Control': 'no-store', 'Set-Cookie': `khatnegar_session=${encodeURIComponent(sessionValue(config))}; HttpOnly${secure}; SameSite=Lax; Path=/; Max-Age=28800` });
+      res.writeHead(303, { 'Location': '/', 'Cache-Control': 'no-store', 'Set-Cookie': `khatnegar_session=${encodeURIComponent(sessionValue(config, user))}; HttpOnly${secure}; SameSite=Lax; Path=/; Max-Age=28800` });
       res.end();
       return false;
     }
     renderLogin(res, true);
     return false;
   }
-  if (validSession(req, config)) return true;
+  if (pathname === '/api/auth/logout' && req.method === 'POST') {
+    res.writeHead(204, { 'Cache-Control': 'no-store', 'Set-Cookie': `khatnegar_session=; HttpOnly${isSecure ? '; Secure' : ''}; SameSite=Lax; Path=/; Max-Age=0` });
+    res.end();
+    return false;
+  }
+  const session = validSession(req, config);
+  if (session) { req.authUser = session; return true; }
   if (pathname.startsWith('/api/')) sendJson(res, 401, { error: 'نشست ورود معتبر نیست.' }); else renderLogin(res);
   return false;
 }
@@ -137,7 +151,18 @@ function validSet(input) {
     ['single', 'assembly'].includes(input.kind) && Array.isArray(input.steps) && input.steps.length <= 100;
 }
 
+function validProjectSet(input) {
+  return input && typeof input.name === 'string' && input.name.trim().length >= 2 &&
+    typeof input.operatorRole === 'string' && input.operatorRole.trim().length >= 2 &&
+    ['single', 'assembly'].includes(input.kind) && Array.isArray(input.steps) && input.steps.length <= 100 &&
+    input.steps.every((step) => step && typeof step.name === 'string' && step.name.trim().length >= 2 && ['internal', 'external'].includes(step.execution));
+}
+
 async function handleApi(req, res, pathname) {
+  if (pathname === '/api/auth/session' && req.method === 'GET') {
+    sendJson(res, 200, { user: req.authUser });
+    return true;
+  }
   if (pathname === '/api/health' && req.method === 'GET') {
     sendJson(res, 200, { status: 'ok', service: 'factory-flow', phase: 1, tls: Boolean(req.socket.encrypted) });
     return true;
@@ -174,7 +199,7 @@ async function handleApi(req, res, pathname) {
   }
   if (pathname === '/api/projects' && req.method === 'GET') {
     const state = await loadState();
-    sendJson(res, 200, { projects: state.projects });
+    sendJson(res, 200, { projects: state.projects.map((project) => ({ ...project, sets: Array.isArray(project.sets) ? project.sets : [] })) });
     return true;
   }
   if (pathname === '/api/projects' && req.method === 'POST') {
@@ -186,11 +211,37 @@ async function handleApi(req, res, pathname) {
     const project = {
       id: randomUUID(), name: input.name.trim(), code: input.code.trim(), itemType: input.itemType,
       drawings: Array.isArray(input.drawings) ? input.drawings.map((value) => String(value).trim()).filter(Boolean).slice(0, 100) : [],
+      sets: [],
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
     state.projects.push(project);
     await saveState(state);
     sendJson(res, 201, { project });
+    return true;
+  }
+  if (pathname.startsWith('/api/projects/') && pathname.endsWith('/route') && req.method === 'PUT') {
+    const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/route'.length));
+    const input = await readJson(req);
+    if (!input || !Array.isArray(input.sets) || input.sets.length > 100 || !input.sets.every(validProjectSet)) {
+      sendJson(res, 422, { error: 'چینش مجموعه‌های پروژه کامل نیست.' }); return true;
+    }
+    const state = await loadState();
+    const index = state.projects.findIndex((project) => project.id === id);
+    if (index < 0) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
+    state.projects[index] = {
+      ...state.projects[index],
+      sets: input.sets.map((set) => ({
+        id: String(set.id || randomUUID()), name: set.name.trim(), code: String(set.code || '').trim(), kind: set.kind,
+        operatorRole: set.operatorRole.trim(),
+        steps: set.steps.map((step) => ({
+          id: String(step.id || randomUUID()), name: step.name.trim(), execution: step.execution,
+          qcRequired: Boolean(step.qcRequired), productionControlRequired: Boolean(step.productionControlRequired), barcodeAfter: Boolean(step.barcodeAfter),
+        })),
+      })),
+      updatedAt: new Date().toISOString(),
+    };
+    await saveState(state);
+    sendJson(res, 200, { project: state.projects[index] });
     return true;
   }
   if (pathname.startsWith('/api/scan/') && req.method === 'GET') {
