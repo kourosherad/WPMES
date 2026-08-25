@@ -87,6 +87,7 @@ function renderLogin(res, invalid = false) {
 async function authorizePublicRequest(req, res, pathname, isSecure) {
   if (!existsSync(publicAuthPath)) { sendJson(res, 503, { error: 'دسترسی عمومی پیکربندی نشده است.' }); return false; }
   const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
+  if ((pathname === '/rivet-ca.cer' || pathname === '/khatnegar-root-ca.cer') && req.method === 'GET') return true;
   if (pathname === '/auth/login.css' && req.method === 'GET') {
     const cssPath = join(root, 'login.css');
     if (!existsSync(cssPath)) { res.writeHead(404); res.end(); return false; }
