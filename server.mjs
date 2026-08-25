@@ -5,6 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode } from './database.mjs';
 
 const appRoot = fileURLToPath(new URL('.', import.meta.url));
 const root = join(appRoot, 'dist');
@@ -74,7 +75,7 @@ function validSession(req, config) {
   if (!payload?.username || !payload?.role || !Number.isFinite(Number(payload.expiresAt)) || Number(payload.expiresAt) < Date.now()) return null;
   const user = authUsers(config).find((item) => item.username === payload.username && item.role === payload.role);
   if (!user || !constantTimeMatch(token, sessionValue(config, user, Number(payload.expiresAt)))) return null;
-  return { username: user.username, displayName: user.displayName || user.username, role: user.role };
+  return { username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || null };
 }
 
 function renderLogin(res, invalid = false) {
@@ -164,7 +165,8 @@ async function handleApi(req, res, pathname) {
     return true;
   }
   if (pathname === '/api/health' && req.method === 'GET') {
-    sendJson(res, 200, { status: 'ok', service: 'factory-flow', phase: 1, tls: Boolean(req.socket.encrypted) });
+    const database = await databaseHealth();
+    sendJson(res, database.configured && !database.connected ? 503 : 200, { status: database.connected || !database.configured ? 'ok' : 'degraded', service: 'factory-flow', phase: 1, tls: Boolean(req.socket.encrypted), database });
     return true;
   }
   if (pathname === '/api/sets' && req.method === 'GET') {
@@ -198,6 +200,10 @@ async function handleApi(req, res, pathname) {
     return true;
   }
   if (pathname === '/api/projects' && req.method === 'GET') {
+    if (databaseConfigured()) {
+      sendJson(res, 200, { projects: await listProjects() });
+      return true;
+    }
     const state = await loadState();
     sendJson(res, 200, { projects: state.projects.map((project) => ({ ...project, sets: Array.isArray(project.sets) ? project.sets : [] })) });
     return true;
@@ -207,10 +213,18 @@ async function handleApi(req, res, pathname) {
     if (!input || typeof input.name !== 'string' || input.name.trim().length < 2 || typeof input.code !== 'string' || input.code.trim().length < 2 || !['single', 'assembly'].includes(input.itemType)) {
       sendJson(res, 422, { error: 'نام، کد و نوع پروژه الزامی است.' }); return true;
     }
+    const normalized = {
+      name: input.name.trim(), code: input.code.trim(), itemType: input.itemType,
+      drawings: Array.isArray(input.drawings) ? input.drawings.map((value) => String(value).trim()).filter(Boolean).slice(0, 100) : [],
+    };
+    if (databaseConfigured()) {
+      const project = await createDatabaseProject(normalized, req.authUser);
+      sendJson(res, 201, { project });
+      return true;
+    }
     const state = await loadState();
     const project = {
-      id: randomUUID(), name: input.name.trim(), code: input.code.trim(), itemType: input.itemType,
-      drawings: Array.isArray(input.drawings) ? input.drawings.map((value) => String(value).trim()).filter(Boolean).slice(0, 100) : [],
+      id: randomUUID(), ...normalized,
       sets: [],
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
@@ -225,27 +239,64 @@ async function handleApi(req, res, pathname) {
     if (!input || !Array.isArray(input.sets) || input.sets.length > 100 || !input.sets.every(validProjectSet)) {
       sendJson(res, 422, { error: 'چینش مجموعه‌های پروژه کامل نیست.' }); return true;
     }
+    const normalizedSets = input.sets.map((set) => ({
+      id: String(set.id || randomUUID()), name: set.name.trim(), code: String(set.code || '').trim(), kind: set.kind,
+      operatorRole: set.operatorRole.trim(),
+      steps: set.steps.map((step) => ({
+        id: String(step.id || randomUUID()), name: step.name.trim(), execution: step.execution,
+        qcRequired: Boolean(step.qcRequired), productionControlRequired: Boolean(step.productionControlRequired), barcodeAfter: Boolean(step.barcodeAfter),
+      })),
+    }));
+    if (databaseConfigured()) {
+      const project = await replaceProjectRoute(id, normalizedSets, req.authUser);
+      sendJson(res, 200, { project });
+      return true;
+    }
     const state = await loadState();
     const index = state.projects.findIndex((project) => project.id === id);
     if (index < 0) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
     state.projects[index] = {
       ...state.projects[index],
-      sets: input.sets.map((set) => ({
-        id: String(set.id || randomUUID()), name: set.name.trim(), code: String(set.code || '').trim(), kind: set.kind,
-        operatorRole: set.operatorRole.trim(),
-        steps: set.steps.map((step) => ({
-          id: String(step.id || randomUUID()), name: step.name.trim(), execution: step.execution,
-          qcRequired: Boolean(step.qcRequired), productionControlRequired: Boolean(step.productionControlRequired), barcodeAfter: Boolean(step.barcodeAfter),
-        })),
-      })),
+      sets: normalizedSets,
       updatedAt: new Date().toISOString(),
     };
     await saveState(state);
     sendJson(res, 200, { project: state.projects[index] });
     return true;
   }
+  if (pathname === '/api/work-items' && req.method === 'POST') {
+    if (req.authUser.role !== 'engineering' && req.authUser.role !== 'admin') { sendJson(res, 403, { error: 'صدور بارکد فقط در اختیار امور مهندسی است.' }); return true; }
+    if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
+    const input = await readJson(req);
+    if (!input || typeof input.projectId !== 'string' || typeof input.setId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2 || typeof input.barcode !== 'string' || input.barcode.trim().length < 2) {
+      sendJson(res, 422, { error: 'پروژه، مجموعه، شماره سریال و بارکد الزامی است.' }); return true;
+    }
+    const item = await issueWorkItem({ projectId: input.projectId, setId: input.setId, serialNumber: input.serialNumber.trim(), barcode: input.barcode.trim().toUpperCase() }, req.authUser);
+    sendJson(res, 201, { item });
+    return true;
+  }
+  if (pathname === '/api/scan/confirm' && req.method === 'POST') {
+    if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
+    const input = await readJson(req);
+    const sources = { camera: 'CAMERA', usb: 'USB_SCANNER', manual: 'MANUAL' };
+    if (!input || typeof input.code !== 'string' || input.code.trim().length < 2 || typeof input.clientRequestId !== 'string' || !sources[input.inputSource] || (input.inputSource === 'manual' && (!input.manualReason || String(input.manualReason).trim().length < 2))) {
+      sendJson(res, 422, { error: 'اطلاعات ثبت اسکن کامل نیست.' }); return true;
+    }
+    const result = await confirmBarcode({
+      code: input.code.trim().toUpperCase(), clientRequestId: input.clientRequestId,
+      inputSource: sources[input.inputSource], manualReason: input.inputSource === 'manual' ? String(input.manualReason).trim() : null,
+    }, req.authUser);
+    sendJson(res, 200, result);
+    return true;
+  }
   if (pathname.startsWith('/api/scan/') && req.method === 'GET') {
     const code = decodeURIComponent(pathname.slice('/api/scan/'.length)).trim();
+    if (databaseConfigured()) {
+      const scan = await resolveBarcode(code, req.authUser);
+      if (!scan) { sendJson(res, 404, { error: 'برای این کد رکورد فعالی ثبت نشده است.' }); return true; }
+      sendJson(res, 200, { scan });
+      return true;
+    }
     const state = await loadState();
     const item = state.items.find((entry) => entry.code === code);
     if (!item) { sendJson(res, 404, { error: 'برای این کد رکوردی ثبت نشده است.' }); return true; }
@@ -263,7 +314,18 @@ async function handle(req, res, isTls) {
   try {
     if (pathname.startsWith('/api/') && await handleApi(req, res, pathname)) return;
   } catch (error) {
-    sendJson(res, error?.message === 'PAYLOAD_TOO_LARGE' ? 413 : 400, { error: 'درخواست قابل پردازش نیست.' });
+    const status = error?.message === 'PAYLOAD_TOO_LARGE' ? 413 : Number(error?.statusCode || (error?.number === 2601 || error?.number === 2627 ? 409 : 400));
+    const scanErrors = {
+      BARCODE_NOT_FOUND: 'بارکد فعال پیدا نشد.', OPERATOR_ASSIGNMENT_REQUIRED: 'برای حساب اپراتور، مجموعه مسئولیت تعیین نشده است.',
+      OPERATOR_NOT_ASSIGNED: 'این مجموعه در حوزه مسئولیت اپراتور نیست.', STEP_NOT_READY: 'این مرحله آماده تأیید اپراتور نیست.',
+      QC_NOT_READY: 'قطعه هنوز در انتظار کنترل کیفیت نیست.', PRODUCTION_CONTROL_NOT_READY: 'قطعه هنوز در انتظار کنترل تولید نیست.',
+      PACKAGING_NOT_READY: 'قطعه هنوز وارد مرحله پکیجینگ نشده است.', ROLE_CANNOT_SCAN: 'نقش فعلی مجوز ثبت عملیات اسکن را ندارد.',
+      SET_ROUTE_NOT_FOUND: 'مسیر مجموعه پیدا نشد.', SET_ROUTE_EMPTY: 'برای این مجموعه زیرفرآیندی تعریف نشده است.',
+    };
+    const message = error?.message === 'ROUTE_ALREADY_IN_USE' ? 'این مسیر وارد تولید شده و باید با نسخه جدید اصلاح شود.' :
+      error?.message === 'PROJECT_NOT_FOUND' ? 'پروژه پیدا نشد.' : status === 409 ? 'کد واردشده قبلاً ثبت شده است.' : 'درخواست قابل پردازش نیست.';
+    console.error('Request failed', { pathname, status, code: error?.code, number: error?.number, message: error?.message });
+    sendJson(res, status, { error: scanErrors[error?.message] || message });
     return;
   }
   if ((pathname === '/rivet-ca.cer' || pathname === '/khatnegar-root-ca.cer') && existsSync(caPath)) {

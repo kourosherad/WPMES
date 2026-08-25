@@ -4,6 +4,20 @@ The phase-one schema targets Microsoft SQL Server. Run `001_initial_schema.sql`
 inside an empty application database after the SQL Server Database Engine and
 the application login have been provisioned.
 
+The VM deployment is automated by:
+
+- `npm run db:provision` — creates `WPMES`, applies migrations, enables mixed
+  authentication, and creates the least-privileged `wpmes_app` login.
+- `npm run db:migrate-state` — imports the previous JSON project data once,
+  without overwriting an existing project code.
+- `node scripts/smoke-production-flow.mjs` — verifies the complete operator,
+  QC, production-control, and packaging gate in an isolated temporary database.
+
+Operator accounts may carry a `scope` value in the identity configuration. It
+must match the engineering-defined operator role of a project set; the API
+rejects a scan when the role or scope does not match the current production
+gate.
+
 Important deployment rules:
 
 - Do not use `sa` from the application.

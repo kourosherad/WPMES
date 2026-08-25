@@ -13,7 +13,12 @@ type RoleId = 'operator' | 'qc' | 'production' | 'packaging' | 'engineering';
 type Step = { id: string; name: string; execution: 'internal' | 'external'; qcRequired: boolean; productionControlRequired: boolean; barcodeAfter: boolean };
 type ProductionSet = { id: string; name: string; code: string; kind: 'single' | 'assembly'; operatorRole: string; steps: Step[] };
 type Project = { id: string; name: string; code: string; itemType: 'single' | 'assembly'; drawings: string[]; sets: ProductionSet[] };
-type SessionUser = { username: string; displayName: string; role: RoleId };
+type SessionUser = { username: string; displayName: string; role: RoleId; scope?: string | null };
+type ScanResolution = {
+  code: string; project: { id: string; code: string; name: string }; set: { id: string; code: string; name: string };
+  step: { id: string; name: string } | null; serialNumber: string; status: string; executionStatus: string | null;
+  allowed: boolean; action: { code: string; title: string } | null; rejectionReason: string | null;
+};
 
 const roles = [
   { id: 'operator' as const, title: 'اپراتور تولید', action: 'ثبت پایان عملیات' },
@@ -108,22 +113,35 @@ function ScanPage({ role }: { role: (typeof roles)[number] }) {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [usbCode, setUsbCode] = useState('');
-  const [result, setResult] = useState<{ code: string; found: boolean; message: string } | null>(null);
+  const [result, setResult] = useState<{ code: string; found: boolean; message: string; scan?: ScanResolution; inputSource: 'camera' | 'usb' | 'manual'; manualReason?: string; confirmed?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
 
-  const process = async (raw: string) => {
+  const process = async (raw: string, inputSource: 'camera' | 'usb' | 'manual', manualReason?: string) => {
     const code = raw.trim().toUpperCase();
     if (code.length < 2) return;
     setBusy(true); setCameraOpen(false); setManualOpen(false);
     try {
       const response = await fetch(`/api/scan/${encodeURIComponent(code)}`);
       const data = await response.json();
-      setResult({ code, found: response.ok, message: response.ok ? 'کد شناسایی شد.' : data.error || 'رکوردی برای این کد ثبت نشده است.' });
-    } catch { setResult({ code, found: false, message: 'ارتباط با سرور برقرار نشد.' }); }
+      const scan = data.scan as ScanResolution | undefined;
+      setResult({ code, found: response.ok, scan, inputSource, manualReason, message: response.ok ? (scan?.allowed ? scan.action?.title || 'کد آماده ثبت است.' : 'این کد برای نقش فعلی قابل اقدام نیست.') : data.error || 'رکوردی برای این کد ثبت نشده است.' });
+    } catch { setResult({ code, found: false, inputSource, manualReason, message: 'ارتباط با سرور برقرار نشد.' }); }
     finally { setBusy(false); }
   };
 
-  const usbSubmit = (event: FormEvent) => { event.preventDefault(); void process(usbCode); setUsbCode(''); };
+  const confirm = async () => {
+    if (!result?.scan?.allowed) return;
+    setBusy(true);
+    try {
+      const response = await fetch('/api/scan/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: result.code, inputSource: result.inputSource, manualReason: result.manualReason, clientRequestId: crypto.randomUUID() }) });
+      const data = await response.json();
+      if (!response.ok) { setResult({ ...result, message: data.error || 'عملیات ثبت نشد.' }); return; }
+      setResult({ ...result, confirmed: true, scan: data.next || result.scan, message: data.duplicate ? 'این درخواست قبلاً ثبت شده است.' : `${data.action} با موفقیت ثبت شد.` });
+    } catch { setResult({ ...result, message: 'ارتباط با سرور برقرار نشد.' }); }
+    finally { setBusy(false); }
+  };
+
+  const usbSubmit = (event: FormEvent) => { event.preventDefault(); void process(usbCode, 'usb'); setUsbCode(''); };
 
   return <>
     <PageHeader eyebrow="ایستگاه اسکن" title="اسکن مجموعه"><div className="active-operation"><span>عملیات این کاربر</span><b>{role.action}</b></div></PageHeader>
@@ -135,11 +153,11 @@ function ScanPage({ role }: { role: (typeof roles)[number] }) {
         <button className="camera-primary" type="button" onClick={() => setCameraOpen(true)} disabled={busy}><Camera size={20} /><span>باز کردن دوربین</span><ArrowLeft size={18} /></button>
         <div className="scan-alternatives"><form onSubmit={usbSubmit}><Barcode size={18} /><input value={usbCode} onChange={(event) => setUsbCode(event.target.value)} placeholder="بارکدخوان رومیزی" /><kbd>Enter</kbd></form><button type="button" onClick={() => setManualOpen(true)}><PenLine size={17} /><span>ورود دستی</span></button></div>
       </div>}
-      {result && <div className={`scan-result ${result.found ? 'found' : 'missing'}`}><span className="result-icon">{result.found ? <CircleCheck size={32} /> : <CircleAlert size={32} />}</span><small>کد خوانده‌شده</small><h2>{result.code}</h2><p>{result.message}</p><button type="button" onClick={() => setResult(null)}><ScanLine size={17} /> اسکن کد دیگر</button></div>}
+      {result && <div className={`scan-result ${result.found && result.scan?.allowed ? 'found' : 'missing'}`}><span className="result-icon">{result.confirmed || (result.found && result.scan?.allowed) ? <CircleCheck size={32} /> : <CircleAlert size={32} />}</span><small>کد خوانده‌شده</small><h2>{result.code}</h2>{result.scan && <div className="scan-resolved-card"><span><small>پروژه</small><b>{result.scan.project.name}</b></span><span><small>مجموعه</small><b>{result.scan.set.name}</b></span><span><small>مرحله جاری</small><b>{result.scan.step?.name || 'پکیجینگ'}</b></span><span><small>شماره سریال</small><b>{result.scan.serialNumber}</b></span></div>}<p>{result.message}</p><div className="scan-result-actions">{result.scan?.allowed && !result.confirmed && <button className="confirm-scan" type="button" onClick={() => void confirm()} disabled={busy}><CircleCheck size={17} /> {busy ? 'در حال ثبت' : result.scan.action?.title}</button>}<button type="button" onClick={() => setResult(null)}><ScanLine size={17} /> اسکن کد دیگر</button></div></div>}
       <div className="scan-console-foot"><span><i /> وضعیت: آماده</span><span>نوع اقدام: {role.action}</span></div>
-      {cameraOpen && <CameraReader role={role} onClose={() => setCameraOpen(false)} onRead={(code) => void process(code)} />}
+      {cameraOpen && <CameraReader role={role} onClose={() => setCameraOpen(false)} onRead={(code) => void process(code, 'camera')} />}
     </section>
-    {manualOpen && <ManualEntry onClose={() => setManualOpen(false)} onDone={(code) => void process(code)} />}
+    {manualOpen && <ManualEntry onClose={() => setManualOpen(false)} onDone={(code, reason) => void process(code, 'manual', reason)} />}
   </>;
 }
 
@@ -176,10 +194,10 @@ function CameraReader({ role, onClose, onRead }: { role: (typeof roles)[number];
 
 function CameraState({ icon, title, text }: { icon: React.ReactNode; title: string; text: string }) { return <div className="camera-state">{icon}<b>{title}</b><span>{text}</span></div>; }
 
-function ManualEntry({ onClose, onDone }: { onClose: () => void; onDone: (code: string) => void }) {
+function ManualEntry({ onClose, onDone }: { onClose: () => void; onDone: (code: string, reason: string) => void }) {
   const [code, setCode] = useState('');
   const [reason, setReason] = useState('');
-  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal small"><header><div><span>ثبت جایگزین</span><h2>ورود دستی کد</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><label>کد مجموعه<input autoFocus value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="کد روی لیبل" /></label><label>دلیل ورود دستی<select value={reason} onChange={(event) => setReason(event.target.value)}><option value="">انتخاب کنید</option><option>لیبل ناخوانا</option><option>دوربین در دسترس نیست</option><option>بارکدخوان ایستگاه در دسترس نیست</option></select></label><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={code.trim().length < 2 || !reason} onClick={() => onDone(code.trim())}>بررسی کد</button></footer></section></div>;
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal small"><header><div><span>ثبت جایگزین</span><h2>ورود دستی کد</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><label>کد مجموعه<input autoFocus value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="کد روی لیبل" /></label><label>دلیل ورود دستی<select value={reason} onChange={(event) => setReason(event.target.value)}><option value="">انتخاب کنید</option><option>لیبل ناخوانا</option><option>دوربین در دسترس نیست</option><option>بارکدخوان ایستگاه در دسترس نیست</option></select></label><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={code.trim().length < 2 || !reason} onClick={() => onDone(code.trim(), reason)}>بررسی کد</button></footer></section></div>;
 }
 
 function EmptyPage({ eyebrow, title, text, icon, action }: { eyebrow: string; title: string; text: string; icon: React.ReactNode; action?: React.ReactNode }) {
@@ -274,8 +292,16 @@ function NewSetModal({ onClose, onCreate }: { onClose: () => void; onCreate: (va
 
 function ProjectsPage({ projects, onProjects, notify }: { projects: Project[]; onProjects: (projects: Project[]) => void; notify: (message: string) => void }) {
   const [open, setOpen] = useState(false);
+  const [issueProject, setIssueProject] = useState<Project | null>(null);
   const create = async (input: Omit<Project, 'id' | 'sets'>) => { const response = await fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'پروژه ذخیره نشد.'); return; } onProjects([...projects, data.project]); setOpen(false); notify('پروژه ایجاد شد؛ اکنون مسیر آن را در مهندسی تعریف کنید.'); };
-  return <><PageHeader eyebrow="دفتر پروژه‌ها" title="پروژه‌ها"><button className="heading-action" type="button" onClick={() => setOpen(true)}><Plus size={18} /> پروژه جدید</button></PageHeader>{projects.length ? <section className="entity-grid">{projects.map((project) => <article className="entity-card" key={project.id}><span className="entity-icon"><Factory size={22} /></span><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p></article>)}</section> : <EmptyCanvas title="پروژه‌ای ثبت نشده" text="نام پروژه، کد، نقشه‌ها و نوع ساخت را ثبت کنید." icon={<FolderKanban size={32} />} action={<button className="empty-action" type="button" onClick={() => setOpen(true)}><Plus size={17} /> تعریف اولین پروژه</button>} />}{open && <NewProjectModal onClose={() => setOpen(false)} onCreate={(input) => void create(input)} />}</>;
+  const issue = async (input: { projectId: string; setId: string; serialNumber: string; barcode: string }) => { const response = await fetch('/api/work-items', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'شناسه تولید صادر نشد.'); return; } setIssueProject(null); notify(`بارکد ${data.item.barcode} صادر شد.`); };
+  return <><PageHeader eyebrow="دفتر پروژه‌ها" title="پروژه‌ها"><button className="heading-action" type="button" onClick={() => setOpen(true)}><Plus size={18} /> پروژه جدید</button></PageHeader>{projects.length ? <section className="entity-grid">{projects.map((project) => <article className="entity-card" key={project.id}><span className="entity-icon"><Factory size={22} /></span><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p><div className="entity-card-actions"><button type="button" disabled={!project.sets?.length} onClick={() => setIssueProject(project)}><Barcode size={15} /> {project.sets?.length ? 'صدور بارکد تولید' : 'ابتدا مسیر را تعریف کنید'}</button></div></article>)}</section> : <EmptyCanvas title="پروژه‌ای ثبت نشده" text="نام پروژه، کد، نقشه‌ها و نوع ساخت را ثبت کنید." icon={<FolderKanban size={32} />} action={<button className="empty-action" type="button" onClick={() => setOpen(true)}><Plus size={17} /> تعریف اولین پروژه</button>} />}{open && <NewProjectModal onClose={() => setOpen(false)} onCreate={(input) => void create(input)} />}{issueProject && <IssueWorkItemModal project={issueProject} onClose={() => setIssueProject(null)} onIssue={(input) => void issue(input)} />}</>;
+}
+
+function IssueWorkItemModal({ project, onClose, onIssue }: { project: Project; onClose: () => void; onIssue: (value: { projectId: string; setId: string; serialNumber: string; barcode: string }) => void }) {
+  const [setId, setSetId] = useState(project.sets[0]?.id || ''); const [serialNumber, setSerialNumber] = useState(''); const [barcode, setBarcode] = useState('');
+  const makeBarcode = () => { const serial = serialNumber.trim().replace(/\s+/g, '-').toUpperCase(); if (serial) setBarcode(`${project.code}-${serial}`.replace(/[^A-Z0-9\-_]/gi, '').slice(0, 100)); };
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal small"><header><div><span>{project.code}</span><h2>صدور بارکد تولید</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><label>مجموعه<select value={setId} onChange={(event) => setSetId(event.target.value)}>{project.sets.map((set) => <option key={set.id} value={set.id}>{set.name} · {set.code || 'بدون کد'}</option>)}</select></label><label>شماره سریال<input value={serialNumber} onChange={(event) => setSerialNumber(event.target.value.toUpperCase())} placeholder="شماره سریال واقعی قطعه" /></label><label>کد بارکد<div className="barcode-compose"><input value={barcode} onChange={(event) => setBarcode(event.target.value.toUpperCase())} placeholder="کد یکتا" /><button type="button" onClick={makeBarcode}>ساخت کد</button></div></label><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={!setId || serialNumber.trim().length < 2 || barcode.trim().length < 2} onClick={() => onIssue({ projectId: project.id, setId, serialNumber: serialNumber.trim(), barcode: barcode.trim() })}>صدور شناسه</button></footer></section></div>;
 }
 
 function NewProjectModal({ onClose, onCreate }: { onClose: () => void; onCreate: (value: Omit<Project, 'id' | 'sets'>) => void }) {
