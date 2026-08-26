@@ -6,6 +6,19 @@ Set-Location -LiteralPath $app
 New-Item -ItemType Directory -Path (Join-Path $app 'logs') -Force | Out-Null
 
 try {
+  $dbConfig = Get-Content -LiteralPath (Join-Path $app 'secrets\database.json') -Raw | ConvertFrom-Json
+  $env:WPMES_DB_PASSWORD = $dbConfig.password
+  $env:WPMES_SKIP_CONFIG_WRITE = '1'
+  $migrationOut = Join-Path $app 'logs\migration-out.log'
+  $migrationError = Join-Path $app 'logs\migration-error.log'
+  $migration = Start-Process -FilePath 'C:\Program Files\nodejs\node.exe' -ArgumentList 'scripts\provision-database.mjs' -WorkingDirectory $app -Wait -PassThru -RedirectStandardOutput $migrationOut -RedirectStandardError $migrationError
+  Remove-Item Env:WPMES_DB_PASSWORD -ErrorAction SilentlyContinue
+  Remove-Item Env:WPMES_SKIP_CONFIG_WRITE -ErrorAction SilentlyContinue
+  if ($migration.ExitCode -ne 0) {
+    Get-Content -LiteralPath $migrationError -ErrorAction SilentlyContinue | Set-Content -LiteralPath $log
+    throw "Database migration failed with exit code $($migration.ExitCode)"
+  }
+
   $smokeOut = Join-Path $app 'logs\smoke-route-out.log'
   $smokeError = Join-Path $app 'logs\smoke-route-error.log'
   $smoke = Start-Process -FilePath 'C:\Program Files\nodejs\node.exe' -ArgumentList 'scripts\smoke-production-flow.mjs' -WorkingDirectory $app -Wait -PassThru -RedirectStandardOutput $smokeOut -RedirectStandardError $smokeError

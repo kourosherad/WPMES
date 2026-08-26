@@ -283,9 +283,15 @@ async function handleApi(req, res, pathname) {
     if (!input || typeof input.code !== 'string' || input.code.trim().length < 2 || typeof input.clientRequestId !== 'string' || !sources[input.inputSource] || (input.inputSource === 'manual' && (!input.manualReason || String(input.manualReason).trim().length < 2))) {
       sendJson(res, 422, { error: 'اطلاعات ثبت اسکن کامل نیست.' }); return true;
     }
+    const decision = input.decision === 'reject' ? 'reject' : 'approve';
+    if (decision === 'reject' && (req.authUser.role !== 'qc' || !['same_step', 'independent'].includes(input.reworkMode) || typeof input.comment !== 'string' || input.comment.trim().length < 3)) {
+      sendJson(res, 422, { error: 'برای رد کنترل کیفیت، نوع بازکاری و شرح علت الزامی است.' }); return true;
+    }
     const result = await confirmBarcode({
       code: input.code.trim().toUpperCase(), clientRequestId: input.clientRequestId,
       inputSource: sources[input.inputSource], manualReason: input.inputSource === 'manual' ? String(input.manualReason).trim() : null,
+      decision, reworkMode: decision === 'reject' ? input.reworkMode : null,
+      comment: decision === 'reject' ? input.comment.trim() : null,
     }, req.authUser);
     sendJson(res, 200, result);
     return true;

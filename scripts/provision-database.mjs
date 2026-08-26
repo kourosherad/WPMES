@@ -38,6 +38,7 @@ try {
   const tableCheck = await applicationDatabase.request().query("SELECT OBJECT_ID(N'security.Users', N'U') AS Id");
   if (!tableCheck.recordset[0].Id) await runMigration(applicationDatabase, '001_initial_schema.sql');
   await runMigration(applicationDatabase, '002_project_route_columns.sql');
+  await runMigration(applicationDatabase, '003_qc_rework_cases.sql');
   const safePassword = password.replaceAll("'", "''");
   await applicationDatabase.request().batch(`
     IF SUSER_ID(N'${login}') IS NULL
@@ -59,10 +60,12 @@ try {
   await masterConfiguration.close();
 }
 
-await mkdir(dirname(configPath), { recursive: true });
-await writeFile(configPath, JSON.stringify({
-  server: 'localhost', port: 1433, database, user: login, password,
-  encrypt: true, trustServerCertificate: true,
-}, null, 2), 'utf8');
+if (process.env.WPMES_SKIP_CONFIG_WRITE !== '1') {
+  await mkdir(dirname(configPath), { recursive: true });
+  await writeFile(configPath, JSON.stringify({
+    server: 'localhost', port: 1433, database, user: login, password,
+    encrypt: true, trustServerCertificate: true,
+  }, null, 2), 'utf8');
+}
 
 console.log(JSON.stringify({ database, login, configured: true }));

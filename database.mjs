@@ -393,7 +393,12 @@ export async function confirmBarcode(input, actor) {
     const contextResult = await barcodeContext(new sql.Request(transaction), input.code, true);
     const row = contextResult.recordset[0];
     if (!row) { const error = new Error('BARCODE_NOT_FOUND'); error.statusCode = 404; throw error; }
-    const action = actionFor(row, actor);
+    let action = actionFor(row, actor);
+    if (actor.role === 'qc' && input.decision === 'reject') {
+      action = row.ExecutionStatus === 'WAITING_QC'
+        ? { allowed: true, code: 'QC_REJECT', title: input.reworkMode === 'independent' ? 'ارجاع به بازکاری مستقل' : 'بازگشت به همین مجموعه' }
+        : { allowed: false, reason: 'QC_NOT_READY' };
+    }
     if (!action.allowed) { const error = new Error(action.reason); error.statusCode = 409; throw error; }
     const scanSessionId = await ensureScanSession(new sql.Request(transaction), identity, actor);
     if (action.code === 'OPERATOR_COMPLETE') {
@@ -407,8 +412,31 @@ export async function confirmBarcode(input, actor) {
     } else if (action.code === 'PRODUCTION_APPROVE') {
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
         .query(`UPDATE production.StepExecutions SET Status='COMPLETED', ProductionControlCompletedAtUtc=SYSUTCDATETIME() WHERE Id=@executionId;`);
+    } else if (action.code === 'QC_REJECT') {
+      const mode = input.reworkMode === 'independent' ? 'INDEPENDENT' : 'SAME_STEP';
+      const caseStatus = mode === 'INDEPENDENT' ? 'AWAITING_ROUTE' : 'RETURNED_TO_STEP';
+      await new sql.Request(transaction)
+        .input('workItemId', sql.UniqueIdentifier, row.WorkItemId).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
+        .input('mode', sql.VarChar(30), mode).input('status', sql.VarChar(30), caseStatus)
+        .input('reason', sql.NVarChar(1000), input.comment).input('userId', sql.UniqueIdentifier, identity.UserId)
+        .input('roleId', sql.UniqueIdentifier, identity.RoleId)
+        .query(`INSERT INTO production.ReworkCases (WorkItemId, SourceStepExecutionId, ReworkMode, Status, Reason, CreatedByUserId, CreatedByRoleId)
+                VALUES (@workItemId,@executionId,@mode,@status,@reason,@userId,@roleId);`);
+      if (mode === 'SAME_STEP') {
+        await new sql.Request(transaction)
+          .input('workItemId', sql.UniqueIdentifier, row.WorkItemId).input('stepId', sql.UniqueIdentifier, row.RouteStepId)
+          .input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
+          .query(`UPDATE production.StepExecutions SET Status='QC_REJECTED', QcCompletedAtUtc=SYSUTCDATETIME(), CompletedAtUtc=SYSUTCDATETIME() WHERE Id=@executionId;
+                  DECLARE @Attempt INT = (SELECT ISNULL(MAX(AttemptNumber),0)+1 FROM production.StepExecutions WHERE WorkItemId=@workItemId AND RouteStepId=@stepId);
+                  INSERT INTO production.StepExecutions (WorkItemId, RouteStepId, AttemptNumber, Status) VALUES (@workItemId,@stepId,@Attempt,'READY');
+                  UPDATE production.WorkItems SET CurrentStatus='READY' WHERE Id=@workItemId;`);
+      } else {
+        await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, row.WorkItemId).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
+          .query(`UPDATE production.StepExecutions SET Status='REWORK_REQUIRED', QcCompletedAtUtc=SYSUTCDATETIME() WHERE Id=@executionId;
+                  UPDATE production.WorkItems SET CurrentStatus='ON_HOLD' WHERE Id=@workItemId;`);
+      }
     }
-    {
+    if (action.code !== 'QC_REJECT') {
       const execution = await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
         .query('SELECT Status FROM production.StepExecutions WHERE Id=@executionId;');
       if (execution.recordset[0].Status === 'COMPLETED') {
@@ -458,11 +486,13 @@ export async function confirmBarcode(input, actor) {
       .query(`INSERT INTO production.ScanEvents (ClientRequestId, ScanSessionId, WorkItemId, BarcodeId, StepExecutionId, InputSource, RawCode, ResolvedAction, Result, ManualEntryReason)
               VALUES (@requestId,@sessionId,@workItemId,@barcodeId,@executionId,@source,@code,@action,'ACCEPTED',@manualReason);`);
     {
-      const approvalType = { OPERATOR_COMPLETE: 'OPERATOR', QC_APPROVE: 'QUALITY_CONTROL', PRODUCTION_APPROVE: 'PRODUCTION_CONTROL' }[action.code];
+      const approvalType = { OPERATOR_COMPLETE: 'OPERATOR', QC_APPROVE: 'QUALITY_CONTROL', QC_REJECT: 'QUALITY_CONTROL', PRODUCTION_APPROVE: 'PRODUCTION_CONTROL' }[action.code];
+      const decision = action.code === 'QC_REJECT' ? 'REJECTED' : 'APPROVED';
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
-        .input('type', sql.VarChar(30), approvalType).input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
-        .query(`INSERT INTO production.ApprovalDecisions (StepExecutionId, ApprovalType, Decision, DecidedByUserId, DecidedByRoleId)
-                VALUES (@executionId,@type,'APPROVED',@userId,@roleId);`);
+        .input('type', sql.VarChar(30), approvalType).input('decision', sql.VarChar(30), decision)
+        .input('comment', sql.NVarChar(1000), input.comment || null).input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
+        .query(`INSERT INTO production.ApprovalDecisions (StepExecutionId, ApprovalType, Decision, DecidedByUserId, DecidedByRoleId, Comment)
+                VALUES (@executionId,@type,@decision,@userId,@roleId,@comment);`);
     }
     await new sql.Request(transaction).input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
       .input('correlationId', sql.UniqueIdentifier, input.clientRequestId).input('entityId', sql.NVarChar(100), row.WorkItemId)

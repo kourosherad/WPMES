@@ -13,13 +13,22 @@ const code = `SMOKE-${Date.now()}`;
 await database.issueWorkItem({ projectId: project.id, serialNumber: 'SMOKE-SERIAL', barcode: code }, engineering);
 const actors = [
   { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' },
+  { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc', decision: 'reject', reworkMode: 'same_step', comment: 'Smoke same-step repair' },
+  { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' },
   { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc' },
   { username: 'smoke.production', displayName: 'Smoke Production', role: 'production' },
   { username: 'smoke.delivery', displayName: 'Smoke Delivery', role: 'operator', scope: 'DELIVERY_SCOPE' },
   { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc' },
   { username: 'smoke.production', displayName: 'Smoke Production', role: 'production' },
 ];
-for (const actor of actors) await database.confirmBarcode({ code, clientRequestId: randomUUID(), inputSource: 'CAMERA', manualReason: null }, actor);
+for (const actor of actors) await database.confirmBarcode({ code, clientRequestId: randomUUID(), inputSource: 'CAMERA', manualReason: null, decision: actor.decision || 'approve', reworkMode: actor.reworkMode || null, comment: actor.comment || null }, actor);
+
+const independentCode = `SMOKE-HOLD-${Date.now()}`;
+await database.issueWorkItem({ projectId: project.id, serialNumber: 'SMOKE-HOLD-SERIAL', barcode: independentCode }, engineering);
+const weldOperator = { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' };
+const qualityControl = { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc' };
+await database.confirmBarcode({ code: independentCode, clientRequestId: randomUUID(), inputSource: 'CAMERA', manualReason: null, decision: 'approve' }, weldOperator);
+await database.confirmBarcode({ code: independentCode, clientRequestId: randomUUID(), inputSource: 'CAMERA', manualReason: null, decision: 'reject', reworkMode: 'independent', comment: 'Smoke independent rework route' }, qualityControl);
 
 const pool = await database.databasePool();
 const result = await pool.request().input('code', sql.NVarChar(160), code).query(`SELECT WorkItems.CurrentStatus,
@@ -27,6 +36,10 @@ const result = await pool.request().input('code', sql.NVarChar(160), code).query
     (SELECT COUNT_BIG(*) FROM production.ApprovalDecisions Decisions JOIN production.StepExecutions Executions ON Executions.Id=Decisions.StepExecutionId WHERE Executions.WorkItemId=WorkItems.Id) AS ApprovalCount
   FROM production.WorkItems WorkItems JOIN production.Barcodes Barcodes ON Barcodes.WorkItemId=WorkItems.Id WHERE Barcodes.BarcodeValue=@code;`);
 const row = result.recordset[0];
-if (row.CurrentStatus !== 'COMPLETED' || Number(row.ScanCount) !== 6 || Number(row.ApprovalCount) !== 6) throw new Error(`SMOKE_ASSERTION_FAILED:${JSON.stringify(row)}`);
-console.log(JSON.stringify({ status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }));
+if (row.CurrentStatus !== 'COMPLETED' || Number(row.ScanCount) !== 8 || Number(row.ApprovalCount) !== 8) throw new Error(`SMOKE_ASSERTION_FAILED:${JSON.stringify(row)}`);
+const hold = await pool.request().input('code', sql.NVarChar(160), independentCode).query(`SELECT WorkItems.CurrentStatus,
+    (SELECT TOP (1) Status FROM production.ReworkCases Cases WHERE Cases.WorkItemId=WorkItems.Id ORDER BY CreatedAtUtc DESC) AS ReworkStatus
+  FROM production.WorkItems WorkItems JOIN production.Barcodes Barcodes ON Barcodes.WorkItemId=WorkItems.Id WHERE Barcodes.BarcodeValue=@code;`);
+if (hold.recordset[0].CurrentStatus !== 'ON_HOLD' || hold.recordset[0].ReworkStatus !== 'AWAITING_ROUTE') throw new Error(`INDEPENDENT_REWORK_ASSERTION_FAILED:${JSON.stringify(hold.recordset[0])}`);
+console.log(JSON.stringify({ completed: { status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }, independentRework: hold.recordset[0] }));
 await pool.close();

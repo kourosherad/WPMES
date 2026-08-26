@@ -113,6 +113,7 @@ function PageHeader({ eyebrow, title, children }: { eyebrow: string; title: stri
 function ScanPage({ role }: { role: (typeof roles)[number] }) {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
+  const [reworkOpen, setReworkOpen] = useState(false);
   const [usbCode, setUsbCode] = useState('');
   const [result, setResult] = useState<{ code: string; found: boolean; message: string; scan?: ScanResolution; inputSource: 'camera' | 'usb' | 'manual'; manualReason?: string; confirmed?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -130,11 +131,11 @@ function ScanPage({ role }: { role: (typeof roles)[number] }) {
     finally { setBusy(false); }
   };
 
-  const confirm = async () => {
+  const confirm = async (decision: 'approve' | 'reject' = 'approve', rework?: { mode: 'same_step' | 'independent'; comment: string }) => {
     if (!result?.scan?.allowed) return;
-    setBusy(true);
+    setBusy(true); setReworkOpen(false);
     try {
-      const response = await fetch('/api/scan/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: result.code, inputSource: result.inputSource, manualReason: result.manualReason, clientRequestId: crypto.randomUUID() }) });
+      const response = await fetch('/api/scan/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: result.code, inputSource: result.inputSource, manualReason: result.manualReason, clientRequestId: crypto.randomUUID(), decision, reworkMode: rework?.mode, comment: rework?.comment }) });
       const data = await response.json();
       if (!response.ok) { setResult({ ...result, message: data.error || 'عملیات ثبت نشد.' }); return; }
       setResult({ ...result, confirmed: true, scan: data.next || result.scan, message: data.duplicate ? 'این درخواست قبلاً ثبت شده است.' : `${data.action} با موفقیت ثبت شد.` });
@@ -154,11 +155,12 @@ function ScanPage({ role }: { role: (typeof roles)[number] }) {
         <button className="camera-primary" type="button" onClick={() => setCameraOpen(true)} disabled={busy}><Camera size={20} /><span>باز کردن دوربین</span><ArrowLeft size={18} /></button>
         <div className="scan-alternatives"><form onSubmit={usbSubmit}><Barcode size={18} /><input value={usbCode} onChange={(event) => setUsbCode(event.target.value)} placeholder="بارکدخوان رومیزی" /><kbd>Enter</kbd></form><button type="button" onClick={() => setManualOpen(true)}><PenLine size={17} /><span>ورود دستی</span></button></div>
       </div>}
-      {result && <div className={`scan-result ${result.found && result.scan?.allowed ? 'found' : 'missing'}`}><span className="result-icon">{result.confirmed || (result.found && result.scan?.allowed) ? <CircleCheck size={32} /> : <CircleAlert size={32} />}</span><small>کد خوانده‌شده</small><h2>{result.code}</h2>{result.scan && <div className="scan-resolved-card"><span><small>پروژه</small><b>{result.scan.project.name}</b></span><span><small>مجموعه</small><b>{result.scan.set.name}</b></span><span><small>مرحله جاری</small><b>{result.scan.step?.name || 'پکیجینگ'}</b></span><span><small>شماره سریال</small><b>{result.scan.serialNumber}</b></span></div>}<p>{result.message}</p><div className="scan-result-actions">{result.scan?.allowed && !result.confirmed && <button className="confirm-scan" type="button" onClick={() => void confirm()} disabled={busy}><CircleCheck size={17} /> {busy ? 'در حال ثبت' : result.scan.action?.title}</button>}<button type="button" onClick={() => setResult(null)}><ScanLine size={17} /> اسکن کد دیگر</button></div></div>}
+      {result && <div className={`scan-result ${result.found && result.scan?.allowed ? 'found' : 'missing'}`}><span className="result-icon">{result.confirmed || (result.found && result.scan?.allowed) ? <CircleCheck size={32} /> : <CircleAlert size={32} />}</span><small>کد خوانده‌شده</small><h2>{result.code}</h2>{result.scan && <div className="scan-resolved-card"><span><small>پروژه</small><b>{result.scan.project.name}</b></span><span><small>مجموعه</small><b>{result.scan.set.name}</b></span><span><small>مرحله جاری</small><b>{result.scan.step?.name || 'پایان مسیر'}</b></span><span><small>شماره سریال</small><b>{result.scan.serialNumber}</b></span></div>}<p>{result.message}</p><div className="scan-result-actions">{result.scan?.allowed && !result.confirmed && <><button className="confirm-scan" type="button" onClick={() => void confirm()} disabled={busy}><CircleCheck size={17} /> {busy ? 'در حال ثبت' : result.scan.action?.title}</button>{role.id === 'qc' && result.scan.action?.code === 'QC_APPROVE' && <button className="reject-scan" type="button" onClick={() => setReworkOpen(true)} disabled={busy}><CircleAlert size={17} /> رد و تعیین بازکاری</button>}</>}<button type="button" onClick={() => setResult(null)}><ScanLine size={17} /> اسکن کد دیگر</button></div></div>}
       <div className="scan-console-foot"><span><i /> وضعیت: آماده</span><span>نوع اقدام: {role.action}</span></div>
       {cameraOpen && <CameraReader role={role} onClose={() => setCameraOpen(false)} onRead={(code) => void process(code, 'camera')} />}
     </section>
     {manualOpen && <ManualEntry onClose={() => setManualOpen(false)} onDone={(code, reason) => void process(code, 'manual', reason)} />}
+    {reworkOpen && <ReworkDecisionModal onClose={() => setReworkOpen(false)} onSubmit={(mode, comment) => void confirm('reject', { mode, comment })} />}
   </>;
 }
 
@@ -199,6 +201,12 @@ function ManualEntry({ onClose, onDone }: { onClose: () => void; onDone: (code: 
   const [code, setCode] = useState('');
   const [reason, setReason] = useState('');
   return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal small"><header><div><span>ثبت جایگزین</span><h2>ورود دستی کد</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><label>کد مجموعه<input autoFocus value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="کد روی لیبل" /></label><label>دلیل ورود دستی<select value={reason} onChange={(event) => setReason(event.target.value)}><option value="">انتخاب کنید</option><option>لیبل ناخوانا</option><option>دوربین در دسترس نیست</option><option>بارکدخوان ایستگاه در دسترس نیست</option></select></label><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={code.trim().length < 2 || !reason} onClick={() => onDone(code.trim(), reason)}>بررسی کد</button></footer></section></div>;
+}
+
+function ReworkDecisionModal({ onClose, onSubmit }: { onClose: () => void; onSubmit: (mode: 'same_step' | 'independent', comment: string) => void }) {
+  const [mode, setMode] = useState<'same_step' | 'independent'>('same_step');
+  const [comment, setComment] = useState('');
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal rework-modal"><header><div><span>تصمیم کنترل کیفیت</span><h2>رد قطعه و تعیین مسیر بازکاری</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><p className="rework-intro">نوع بازکاری را بر اساس وضعیت واقعی قطعه مشخص کنید. سابقه عملیات قبلی حفظ خواهد شد.</p><div className="rework-options"><button type="button" className={mode === 'same_step' ? 'active' : ''} onClick={() => setMode('same_step')}><span className="rework-option-icon"><Route size={21} /></span><span><b>بازگشت به همین مجموعه</b><small>قطعه برای تعمیر مجدد به اپراتور همین مرحله برمی‌گردد.</small></span><i>{mode === 'same_step' && <CircleCheck size={16} />}</i></button><button type="button" className={mode === 'independent' ? 'active' : ''} onClick={() => setMode('independent')}><span className="rework-option-icon"><Wrench size={21} /></span><span><b>بازکاری مستقل</b><small>قطعه متوقف و برای تعیین مسیر بازکاری جداگانه ارجاع می‌شود.</small></span><i>{mode === 'independent' && <CircleCheck size={16} />}</i></button></div><label>شرح علت رد و اقدام موردنیاز<textarea autoFocus value={comment} onChange={(event) => setComment(event.target.value)} rows={4} placeholder="شرح دقیق ایراد مشاهده‌شده را ثبت کنید" /></label><footer><button type="button" onClick={onClose}>انصراف</button><button className="danger" type="button" disabled={comment.trim().length < 3} onClick={() => onSubmit(mode, comment.trim())}>ثبت رد و ارجاع</button></footer></section></div>;
 }
 
 function EmptyPage({ eyebrow, title, text, icon, action }: { eyebrow: string; title: string; text: string; icon: React.ReactNode; action?: React.ReactNode }) {
