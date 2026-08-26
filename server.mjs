@@ -245,7 +245,7 @@ async function handleApi(req, res, pathname) {
       operatorRole: set.operatorRole.trim(),
       steps: set.steps.map((step) => ({
         id: String(step.id || randomUUID()), name: step.name.trim(), execution: step.execution,
-        qcRequired: Boolean(step.qcRequired), productionControlRequired: Boolean(step.productionControlRequired), barcodeAfter: Boolean(step.barcodeAfter),
+        qcRequired: true, productionControlRequired: true, barcodeAfter: false,
       })),
     }));
     if (databaseConfigured()) {
@@ -269,10 +269,10 @@ async function handleApi(req, res, pathname) {
     if (req.authUser.role !== 'engineering' && req.authUser.role !== 'admin') { sendJson(res, 403, { error: 'صدور بارکد فقط در اختیار امور مهندسی است.' }); return true; }
     if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
     const input = await readJson(req);
-    if (!input || typeof input.projectId !== 'string' || typeof input.setId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2 || typeof input.barcode !== 'string' || input.barcode.trim().length < 2) {
-      sendJson(res, 422, { error: 'پروژه، مجموعه، شماره سریال و بارکد الزامی است.' }); return true;
+    if (!input || typeof input.projectId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2 || typeof input.barcode !== 'string' || input.barcode.trim().length < 2) {
+      sendJson(res, 422, { error: 'پروژه، شماره سریال و بارکد الزامی است.' }); return true;
     }
-    const item = await issueWorkItem({ projectId: input.projectId, setId: input.setId, serialNumber: input.serialNumber.trim(), barcode: input.barcode.trim().toUpperCase() }, req.authUser);
+    const item = await issueWorkItem({ projectId: input.projectId, serialNumber: input.serialNumber.trim(), barcode: input.barcode.trim().toUpperCase() }, req.authUser);
     sendJson(res, 201, { item });
     return true;
   }

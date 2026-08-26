@@ -227,8 +227,8 @@ export async function replaceProjectRoute(projectId, projectSets, actor) {
           .input('order', sql.Int, stepIndex + 1).input('code', sql.NVarChar(60), `${setCode}-S${String(stepIndex + 1).padStart(2, '0')}`)
           .input('name', sql.NVarChar(180), step.name).input('execution', sql.VarChar(20), step.execution === 'external' ? 'EXTERNAL' : 'INTERNAL')
           .input('station', sql.NVarChar(60), set.operatorRole).input('contractor', sql.NVarChar(60), step.execution === 'external' ? 'ENGINEERING_PENDING' : null)
-          .input('qc', sql.Bit, step.qcRequired).input('production', sql.Bit, step.productionControlRequired)
-          .input('barcode', sql.VarChar(40), step.barcodeAfter ? 'AFTER_STEP' : 'NO_CHANGE')
+          .input('qc', sql.Bit, true).input('production', sql.Bit, true)
+          .input('barcode', sql.VarChar(40), 'NO_CHANGE')
           .query(`INSERT INTO engineering.RouteSteps
             (Id, RouteDefinitionId, StepOrder, StepCode, StepName, ExecutionType, WorkstationCode, ContractorCode,
              RequiresQcApproval, RequiresProductionControl, BarcodePolicy)
@@ -259,13 +259,13 @@ export async function issueWorkItem(input, actor) {
     const identity = await ensureIdentity(new sql.Request(transaction), actor);
     const route = await new sql.Request(transaction)
       .input('projectId', sql.UniqueIdentifier, input.projectId)
-      .input('setId', sql.UniqueIdentifier, input.setId)
       .query(`SELECT TOP (1) Items.Id AS ItemDefinitionId, Routes.Id AS RouteDefinitionId, Steps.Id AS FirstStepId
         FROM engineering.ItemDefinitions Items
         JOIN engineering.RouteDefinitions Routes ON Routes.ItemDefinitionId = Items.Id
         LEFT JOIN engineering.RouteSteps Steps ON Steps.RouteDefinitionId = Routes.Id AND Steps.StepOrder = 1
-        WHERE Items.ProjectId = @projectId AND Items.Id = @setId
-        ORDER BY Routes.VersionNumber DESC;`);
+        WHERE Items.ProjectId = @projectId
+          AND Routes.VersionNumber = (SELECT MAX(CurrentRoute.VersionNumber) FROM engineering.RouteDefinitions CurrentRoute WHERE CurrentRoute.ItemDefinitionId = Items.Id)
+        ORDER BY Items.SetOrder, Routes.VersionNumber DESC;`);
     if (!route.recordset.length) { const error = new Error('SET_ROUTE_NOT_FOUND'); error.statusCode = 404; throw error; }
     if (!route.recordset[0].FirstStepId) { const error = new Error('SET_ROUTE_EMPTY'); error.statusCode = 422; throw error; }
     const workItemId = randomUUID();
@@ -307,15 +307,18 @@ function actionFor(context, actor) {
     if (!['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)) return { allowed: false, reason: 'STEP_NOT_READY' };
     return { allowed: true, code: 'OPERATOR_COMPLETE', title: `ثبت اتمام «${context.SetName}»` };
   }
+  if (actor.role === 'packaging') {
+    const station = `${context.SetName || ''} ${context.OperatorRoleKey || ''}`;
+    if (!/پکیج|بسته.?بندی/i.test(station)) return { allowed: false, reason: 'OPERATOR_NOT_ASSIGNED' };
+    if (!['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)) return { allowed: false, reason: 'STEP_NOT_READY' };
+    return { allowed: true, code: 'OPERATOR_COMPLETE', title: `ثبت اتمام «${context.SetName}»` };
+  }
   if (actor.role === 'qc') return context.ExecutionStatus === 'WAITING_QC'
     ? { allowed: true, code: 'QC_APPROVE', title: 'تأیید کنترل کیفیت' }
     : { allowed: false, reason: 'QC_NOT_READY' };
   if (actor.role === 'production') return context.ExecutionStatus === 'WAITING_PRODUCTION_CONTROL'
     ? { allowed: true, code: 'PRODUCTION_APPROVE', title: 'تأیید کنترل تولید' }
     : { allowed: false, reason: 'PRODUCTION_CONTROL_NOT_READY' };
-  if (actor.role === 'packaging') return context.WorkItemStatus === 'WAITING_PACKAGING'
-    ? { allowed: true, code: 'PACKAGING_COMPLETE', title: 'ثبت پایان پکیجینگ' }
-    : { allowed: false, reason: 'PACKAGING_NOT_READY' };
   return { allowed: false, reason: 'ROLE_CANNOT_SCAN' };
 }
 
@@ -404,25 +407,42 @@ export async function confirmBarcode(input, actor) {
     } else if (action.code === 'PRODUCTION_APPROVE') {
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
         .query(`UPDATE production.StepExecutions SET Status='COMPLETED', ProductionControlCompletedAtUtc=SYSUTCDATETIME() WHERE Id=@executionId;`);
-    } else if (action.code === 'PACKAGING_COMPLETE') {
-      await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, row.WorkItemId)
-        .query(`UPDATE production.WorkItems SET CurrentStatus='COMPLETED', CompletedAtUtc=SYSUTCDATETIME() WHERE Id=@workItemId;`);
     }
-    if (action.code !== 'PACKAGING_COMPLETE') {
+    {
       const execution = await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
         .query('SELECT Status FROM production.StepExecutions WHERE Id=@executionId;');
       if (execution.recordset[0].Status === 'COMPLETED') {
         await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
           .query('UPDATE production.StepExecutions SET CompletedAtUtc=SYSUTCDATETIME() WHERE Id=@executionId;');
         const next = await new sql.Request(transaction).input('routeId', sql.UniqueIdentifier, row.RouteDefinitionId).input('order', sql.Int, row.StepOrder)
-          .query('SELECT TOP (1) Id FROM engineering.RouteSteps WHERE RouteDefinitionId=@routeId AND StepOrder>@order ORDER BY StepOrder;');
+          .query('SELECT TOP (1) Id, @routeId AS RouteDefinitionId, NULL AS ItemDefinitionId FROM engineering.RouteSteps WHERE RouteDefinitionId=@routeId AND StepOrder>@order ORDER BY StepOrder;');
         if (next.recordset.length) {
           await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, row.WorkItemId).input('stepId', sql.UniqueIdentifier, next.recordset[0].Id)
             .query(`INSERT INTO production.StepExecutions (WorkItemId, RouteStepId, Status) VALUES (@workItemId,@stepId,'READY');
                     UPDATE production.WorkItems SET CurrentRouteStepId=@stepId, CurrentStatus='READY' WHERE Id=@workItemId;`);
         } else {
-          await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, row.WorkItemId)
-            .query(`UPDATE production.WorkItems SET CurrentRouteStepId=NULL, CurrentStatus='WAITING_PACKAGING' WHERE Id=@workItemId;`);
+          const nextSet = await new sql.Request(transaction)
+            .input('projectId', sql.UniqueIdentifier, row.ProjectId)
+            .input('currentItemId', sql.UniqueIdentifier, row.ItemDefinitionId)
+            .query(`SELECT TOP (1) NextItem.Id AS ItemDefinitionId, NextRoute.Id AS RouteDefinitionId, NextStep.Id
+              FROM engineering.ItemDefinitions CurrentItem
+              JOIN engineering.ItemDefinitions NextItem ON NextItem.ProjectId = CurrentItem.ProjectId AND NextItem.SetOrder > CurrentItem.SetOrder
+              JOIN engineering.RouteDefinitions NextRoute ON NextRoute.ItemDefinitionId = NextItem.Id
+                AND NextRoute.VersionNumber = (SELECT MAX(CurrentRoute.VersionNumber) FROM engineering.RouteDefinitions CurrentRoute WHERE CurrentRoute.ItemDefinitionId = NextItem.Id)
+              JOIN engineering.RouteSteps NextStep ON NextStep.RouteDefinitionId = NextRoute.Id AND NextStep.StepOrder = 1
+              WHERE CurrentItem.Id = @currentItemId AND CurrentItem.ProjectId = @projectId
+              ORDER BY NextItem.SetOrder;`);
+          if (nextSet.recordset.length) {
+            const target = nextSet.recordset[0];
+            await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, row.WorkItemId)
+              .input('itemId', sql.UniqueIdentifier, target.ItemDefinitionId).input('routeId', sql.UniqueIdentifier, target.RouteDefinitionId)
+              .input('stepId', sql.UniqueIdentifier, target.Id)
+              .query(`INSERT INTO production.StepExecutions (WorkItemId, RouteStepId, Status) VALUES (@workItemId,@stepId,'READY');
+                      UPDATE production.WorkItems SET ItemDefinitionId=@itemId, RouteDefinitionId=@routeId, CurrentRouteStepId=@stepId, CurrentStatus='READY' WHERE Id=@workItemId;`);
+          } else {
+            await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, row.WorkItemId)
+              .query(`UPDATE production.WorkItems SET CurrentRouteStepId=NULL, CurrentStatus='COMPLETED', CompletedAtUtc=SYSUTCDATETIME() WHERE Id=@workItemId;`);
+          }
         }
       } else {
         await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, row.WorkItemId).input('status', sql.VarChar(40), execution.recordset[0].Status)
@@ -437,7 +457,7 @@ export async function confirmBarcode(input, actor) {
       .input('manualReason', sql.NVarChar(300), input.manualReason || null)
       .query(`INSERT INTO production.ScanEvents (ClientRequestId, ScanSessionId, WorkItemId, BarcodeId, StepExecutionId, InputSource, RawCode, ResolvedAction, Result, ManualEntryReason)
               VALUES (@requestId,@sessionId,@workItemId,@barcodeId,@executionId,@source,@code,@action,'ACCEPTED',@manualReason);`);
-    if (action.code !== 'PACKAGING_COMPLETE') {
+    {
       const approvalType = { OPERATOR_COMPLETE: 'OPERATOR', QC_APPROVE: 'QUALITY_CONTROL', PRODUCTION_APPROVE: 'PRODUCTION_CONTROL' }[action.code];
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
         .input('type', sql.VarChar(30), approvalType).input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
