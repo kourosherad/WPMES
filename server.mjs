@@ -100,7 +100,7 @@ async function authorizePublicRequest(req, res, pathname, isSecure) {
   if (pathname === '/auth/login.css' && req.method === 'GET') {
     const cssPath = join(root, 'login.css');
     if (!existsSync(cssPath)) { res.writeHead(404); res.end(); return false; }
-    res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'public, max-age=3600' });
+    res.writeHead(200, { 'Content-Type': 'text/css; charset=utf-8', 'Cache-Control': 'no-cache' });
     createReadStream(cssPath).pipe(res);
     return false;
   }
