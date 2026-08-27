@@ -2,10 +2,10 @@ import { createReadStream, existsSync, readFileSync } from 'node:fs';
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises';
 import { createServer as createHttpServer } from 'node:http';
 import { createServer as createHttpsServer } from 'node:https';
-import { createHmac, randomUUID, timingSafeEqual } from 'node:crypto';
+import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode } from './database.mjs';
+import { confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode } from './database.mjs';
 
 const appRoot = fileURLToPath(new URL('.', import.meta.url));
 const root = join(appRoot, 'dist');
@@ -49,9 +49,50 @@ function constantTimeMatch(left, right) {
 }
 
 function authUsers(config) {
-  if (Array.isArray(config.users)) return config.users.filter((user) => user && user.username && user.password && user.role);
+  if (Array.isArray(config.users)) return config.users.filter((user) => user && user.username && (user.password || user.passwordHash) && user.role);
   if (config.username && config.password) return [{ username: config.username, password: config.password, displayName: 'کاربر مهندسی', role: 'engineering' }];
   return [];
+}
+
+function passwordHash(password) {
+  const salt = randomBytes(16).toString('base64url');
+  const derived = scryptSync(String(password), salt, 32).toString('base64url');
+  return `scrypt$${salt}$${derived}`;
+}
+
+function passwordMatches(user, password) {
+  if (user.passwordHash) {
+    const [scheme, salt, expected] = String(user.passwordHash).split('$');
+    if (scheme !== 'scrypt' || !salt || !expected) return false;
+    const actual = scryptSync(String(password), salt, 32).toString('base64url');
+    return constantTimeMatch(actual, expected);
+  }
+  return constantTimeMatch(password, user.password || '');
+}
+
+const permissionCatalog = new Set(['projects', 'project_create', 'engineering', 'production_flow', 'scanner', 'qc', 'production_control', 'packaging', 'access_matrix']);
+const rolePermissionDefaults = {
+  operator: ['scanner'], qc: ['scanner', 'qc'], production: ['scanner', 'production_control'],
+  packaging: ['scanner', 'packaging'], engineering: ['projects', 'engineering'],
+  admin: [...permissionCatalog],
+};
+
+function permissionsFor(user) {
+  if (user.role === 'admin') return [...permissionCatalog];
+  if (!Array.isArray(user.permissions)) return rolePermissionDefaults[user.role] || [];
+  return [...new Set(user.permissions.map((value) => String(value)).filter((value) => permissionCatalog.has(value)))];
+}
+
+function hasPermission(actor, permission) {
+  return actor?.accountRole === 'admin' || actor?.role === 'admin' || actor?.permissions?.includes(permission);
+}
+
+function hasScanRolePermission(actor) {
+  if (!hasPermission(actor, 'scanner')) return false;
+  if (actor.role === 'qc') return hasPermission(actor, 'qc');
+  if (actor.role === 'production') return hasPermission(actor, 'production_control');
+  if (actor.role === 'packaging') return hasPermission(actor, 'packaging');
+  return actor.role === 'operator' || actor.accountRole === 'admin';
 }
 
 function authSecret(config) {
@@ -75,7 +116,7 @@ function validSession(req, config) {
   if (!payload?.username || !payload?.role || !Number.isFinite(Number(payload.expiresAt)) || Number(payload.expiresAt) < Date.now()) return null;
   const user = authUsers(config).find((item) => item.username === payload.username && item.role === payload.role);
   if (!user || !constantTimeMatch(token, sessionValue(config, user, Number(payload.expiresAt)))) return null;
-  return { username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || null };
+  return { username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || null, permissions: permissionsFor(user) };
 }
 
 const delegatedAdminRoles = new Set(['engineering', 'operator', 'qc', 'production', 'packaging']);
@@ -84,7 +125,7 @@ function requestActor(session, req) {
   if (session.role !== 'admin') return session;
   const requestedRole = String(req.headers['x-wpmes-role'] || 'engineering').toLowerCase();
   const role = delegatedAdminRoles.has(requestedRole) ? requestedRole : 'engineering';
-  return { ...session, role, accountRole: 'admin', scope: role === 'operator' ? '*' : session.scope };
+  return { ...session, role, accountRole: 'admin', scope: role === 'operator' ? '*' : session.scope, permissions: [...permissionCatalog] };
 }
 
 function renderLogin(res, invalid = false) {
@@ -108,7 +149,7 @@ async function authorizePublicRequest(req, res, pathname, isSecure) {
   }
   if (pathname === '/auth/login' && req.method === 'POST') {
     const form = new URLSearchParams(await readRaw(req));
-    const user = authUsers(config).find((item) => constantTimeMatch(form.get('username') || '', item.username) && constantTimeMatch(form.get('password') || '', item.password));
+    const user = authUsers(config).find((item) => constantTimeMatch(form.get('username') || '', item.username) && passwordMatches(item, form.get('password') || ''));
     if (user) {
       const secure = isSecure ? '; Secure' : '';
       res.writeHead(303, { 'Location': '/', 'Cache-Control': 'no-store', 'Set-Cookie': `khatnegar_session=${encodeURIComponent(sessionValue(config, user))}; HttpOnly${secure}; SameSite=Lax; Path=/; Max-Age=28800` });
@@ -176,6 +217,56 @@ async function handleApi(req, res, pathname) {
     sendJson(res, 200, { user: req.authUser });
     return true;
   }
+  if (pathname === '/api/admin/access-matrix' && req.method === 'GET') {
+    if (req.authUser.accountRole !== 'admin' && req.authUser.role !== 'admin') { sendJson(res, 403, { error: 'این بخش فقط در اختیار مدیر کل سامانه است.' }); return true; }
+    const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
+    const users = authUsers(config).map((user) => ({
+      username: user.username, displayName: user.displayName || user.username, role: user.role,
+      scope: user.scope || '', permissions: permissionsFor(user), isAdmin: user.role === 'admin',
+    }));
+    sendJson(res, 200, { users, permissions: [...permissionCatalog] });
+    return true;
+  }
+  if (pathname === '/api/admin/access-matrix' && req.method === 'PUT') {
+    if (req.authUser.accountRole !== 'admin' && req.authUser.role !== 'admin') { sendJson(res, 403, { error: 'این بخش فقط در اختیار مدیر کل سامانه است.' }); return true; }
+    const input = await readJson(req);
+    if (!input || !Array.isArray(input.users) || input.users.length > 200) { sendJson(res, 422, { error: 'ماتریس دسترسی معتبر نیست.' }); return true; }
+    const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
+    const updates = new Map(input.users.map((user) => [String(user?.username || ''), user]));
+    const validRoles = new Set(['operator', 'qc', 'production', 'packaging', 'engineering', 'admin']);
+    config.users = authUsers(config).map((user) => {
+      const update = updates.get(user.username);
+      if (!update || user.role === 'admin') return user;
+      const role = validRoles.has(update.role) && update.role !== 'admin' ? update.role : user.role;
+      const permissions = Array.isArray(update.permissions)
+        ? [...new Set(update.permissions.map((value) => String(value)).filter((value) => permissionCatalog.has(value) && value !== 'access_matrix'))]
+        : permissionsFor(user);
+      return { ...user, role, scope: String(update.scope || '').trim() || null, permissions };
+    });
+    await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
+    sendJson(res, 200, { users: config.users.map((user) => ({ username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || '', permissions: permissionsFor(user), isAdmin: user.role === 'admin' })) });
+    return true;
+  }
+  if (pathname === '/api/admin/users' && req.method === 'POST') {
+    if (req.authUser.accountRole !== 'admin' && req.authUser.role !== 'admin') { sendJson(res, 403, { error: 'این بخش فقط در اختیار مدیر کل سامانه است.' }); return true; }
+    const input = await readJson(req);
+    const username = String(input?.username || '').trim().toLowerCase();
+    const displayName = String(input?.displayName || '').trim();
+    const role = String(input?.role || 'operator');
+    const password = String(input?.password || '');
+    const validRoles = new Set(['operator', 'qc', 'production', 'packaging', 'engineering']);
+    if (!/^[a-z0-9._-]{3,60}$/.test(username) || displayName.length < 2 || !validRoles.has(role) || password.length < 10) {
+      sendJson(res, 422, { error: 'نام، نام کاربری انگلیسی، نقش و رمز حداقل ۱۰ کاراکتری الزامی است.' }); return true;
+    }
+    const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
+    const users = authUsers(config);
+    if (users.some((user) => user.username.toLowerCase() === username)) { sendJson(res, 409, { error: 'این نام کاربری قبلاً ثبت شده است.' }); return true; }
+    const user = { username, displayName, role, scope: null, permissions: rolePermissionDefaults[role] || [], passwordHash: passwordHash(password) };
+    config.users = [...users, user];
+    await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
+    sendJson(res, 201, { user: { username, displayName, role, scope: '', permissions: user.permissions, isAdmin: false } });
+    return true;
+  }
   if (pathname === '/api/health' && req.method === 'GET') {
     const database = await databaseHealth();
     sendJson(res, database.configured && !database.connected ? 503 : 200, { status: database.connected || !database.configured ? 'ok' : 'degraded', service: 'factory-flow', phase: 1, tls: Boolean(req.socket.encrypted), database });
@@ -221,6 +312,7 @@ async function handleApi(req, res, pathname) {
     return true;
   }
   if (pathname === '/api/projects' && req.method === 'POST') {
+    if (!hasPermission(req.authUser, 'project_create')) { sendJson(res, 403, { error: 'دسترسی تعریف پروژه برای این کاربر فعال نیست.' }); return true; }
     const input = await readJson(req);
     if (!input || typeof input.name !== 'string' || input.name.trim().length < 2 || typeof input.code !== 'string' || input.code.trim().length < 2 || !['single', 'assembly'].includes(input.itemType)) {
       sendJson(res, 422, { error: 'نام، کد و نوع پروژه الزامی است.' }); return true;
@@ -246,6 +338,7 @@ async function handleApi(req, res, pathname) {
     return true;
   }
   if (pathname.startsWith('/api/projects/') && pathname.endsWith('/route') && req.method === 'PUT') {
+    if (!hasPermission(req.authUser, 'engineering')) { sendJson(res, 403, { error: 'دسترسی مهندسی برای این کاربر فعال نیست.' }); return true; }
     const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/route'.length));
     const input = await readJson(req);
     if (!input || !Array.isArray(input.sets) || input.sets.length > 100 || !input.sets.every(validProjectSet)) {
@@ -276,8 +369,24 @@ async function handleApi(req, res, pathname) {
     sendJson(res, 200, { project: state.projects[index] });
     return true;
   }
+  if (pathname.startsWith('/api/projects/') && req.method === 'DELETE') {
+    if (!hasPermission(req.authUser, 'project_create')) { sendJson(res, 403, { error: 'دسترسی حذف پروژه برای این کاربر فعال نیست.' }); return true; }
+    const id = decodeURIComponent(pathname.slice('/api/projects/'.length));
+    if (!id || id.includes('/')) { sendJson(res, 400, { error: 'شناسه پروژه معتبر نیست.' }); return true; }
+    if (databaseConfigured()) {
+      await deleteDatabaseProject(id, req.authUser);
+    } else {
+      const state = await loadState();
+      const index = state.projects.findIndex((project) => project.id === id);
+      if (index < 0) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
+      state.projects.splice(index, 1);
+      await saveState(state);
+    }
+    sendJson(res, 200, { deleted: true, id });
+    return true;
+  }
   if (pathname === '/api/work-items' && req.method === 'POST') {
-    if (req.authUser.role !== 'engineering' && req.authUser.role !== 'admin') { sendJson(res, 403, { error: 'صدور بارکد فقط در اختیار امور مهندسی است.' }); return true; }
+    if (!hasPermission(req.authUser, 'engineering')) { sendJson(res, 403, { error: 'صدور بارکد فقط در اختیار امور مهندسی است.' }); return true; }
     if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
     const input = await readJson(req);
     if (!input || typeof input.projectId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2 || typeof input.barcode !== 'string' || input.barcode.trim().length < 2) {
@@ -288,6 +397,7 @@ async function handleApi(req, res, pathname) {
     return true;
   }
   if (pathname === '/api/scan/confirm' && req.method === 'POST') {
+    if (!hasScanRolePermission(req.authUser)) { sendJson(res, 403, { error: 'دسترسی نقش عملیاتی این بارکدخوان برای کاربر فعال نیست.' }); return true; }
     if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
     const input = await readJson(req);
     const sources = { camera: 'CAMERA', usb: 'USB_SCANNER', manual: 'MANUAL' };
@@ -308,6 +418,7 @@ async function handleApi(req, res, pathname) {
     return true;
   }
   if (pathname.startsWith('/api/scan/') && req.method === 'GET') {
+    if (!hasScanRolePermission(req.authUser)) { sendJson(res, 403, { error: 'دسترسی نقش عملیاتی این بارکدخوان برای کاربر فعال نیست.' }); return true; }
     const code = decodeURIComponent(pathname.slice('/api/scan/'.length)).trim();
     if (databaseConfigured()) {
       const scan = await resolveBarcode(code, req.authUser);
@@ -341,6 +452,7 @@ async function handle(req, res, isTls) {
       SET_ROUTE_NOT_FOUND: 'مسیر مجموعه پیدا نشد.', SET_ROUTE_EMPTY: 'برای این مجموعه زیرفرآیندی تعریف نشده است.',
     };
     const message = error?.message === 'ROUTE_ALREADY_IN_USE' ? 'این مسیر وارد تولید شده و باید با نسخه جدید اصلاح شود.' :
+      error?.message === 'PROJECT_ALREADY_IN_PRODUCTION' ? 'این پروژه وارد چرخه تولید شده و برای حفظ سوابق قابل حذف نیست.' :
       error?.message === 'PROJECT_NOT_FOUND' ? 'پروژه پیدا نشد.' : status === 409 ? 'کد واردشده قبلاً ثبت شده است.' : 'درخواست قابل پردازش نیست.';
     console.error('Request failed', { pathname, status, code: error?.code, number: error?.number, message: error?.message });
     sendJson(res, status, { error: scanErrors[error?.message] || message });

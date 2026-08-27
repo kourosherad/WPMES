@@ -181,6 +181,44 @@ export async function createProject(input, actor) {
   }
 }
 
+export async function deleteProject(projectId, actor) {
+  const pool = await databasePool();
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const identity = await ensureIdentity(new sql.Request(transaction), actor);
+    const projectResult = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
+      .query('SELECT ProjectCode, ProjectName FROM core.Projects WITH (UPDLOCK, HOLDLOCK) WHERE Id=@projectId;');
+    if (!projectResult.recordset.length) { const error = new Error('PROJECT_NOT_FOUND'); error.statusCode = 404; throw error; }
+    const guard = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
+      .query('SELECT COUNT_BIG(*) AS WorkItemCount FROM production.WorkItems WITH (UPDLOCK, HOLDLOCK) WHERE ProjectId=@projectId;');
+    if (Number(guard.recordset[0].WorkItemCount) > 0) {
+      const error = new Error('PROJECT_ALREADY_IN_PRODUCTION'); error.statusCode = 409; throw error;
+    }
+    await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).query(`
+      DELETE Steps FROM engineering.RouteSteps Steps
+        JOIN engineering.RouteDefinitions Routes ON Routes.Id=Steps.RouteDefinitionId
+        JOIN engineering.ItemDefinitions Items ON Items.Id=Routes.ItemDefinitionId WHERE Items.ProjectId=@projectId;
+      DELETE Routes FROM engineering.RouteDefinitions Routes
+        JOIN engineering.ItemDefinitions Items ON Items.Id=Routes.ItemDefinitionId WHERE Items.ProjectId=@projectId;
+      DELETE FROM engineering.ItemDefinitions WHERE ProjectId=@projectId;
+      DELETE FROM core.Drawings WHERE ProjectId=@projectId;
+      DELETE FROM core.Projects WHERE Id=@projectId;
+    `);
+    await new sql.Request(transaction)
+      .input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
+      .input('correlationId', sql.UniqueIdentifier, randomUUID()).input('entityId', sql.NVarChar(100), projectId)
+      .input('before', sql.NVarChar(sql.MAX), JSON.stringify(projectResult.recordset[0]))
+      .query(`INSERT INTO ops.AuditLogs (ActorUserId, ActorRoleId, EventType, EntityType, EntityId, CorrelationId, BeforeJson)
+              VALUES (@userId,@roleId,'PROJECT_DELETED','PROJECT',@entityId,@correlationId,@before);`);
+    await transaction.commit();
+    return { id: projectId };
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  }
+}
+
 export async function replaceProjectRoute(projectId, projectSets, actor) {
   const pool = await databasePool();
   const transaction = new sql.Transaction(pool);

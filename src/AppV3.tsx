@@ -2,18 +2,20 @@ import { FormEvent, useEffect, useRef, useState } from 'react';
 import { BrowserQRCodeReader, type IScannerControls } from '@zxing/browser';
 import {
   Activity, ArrowDown, ArrowLeft, ArrowUp, Barcode, Boxes, Camera,
-  ChevronLeft, CircleAlert, CircleCheck, ClipboardList, Factory,
+  Check, ChevronLeft, CircleAlert, CircleCheck, Factory,
   FilePlus2, Flashlight, FolderKanban, GripVertical, Layers3, Menu, PackageOpen,
-  LogOut, PenLine, Plus, QrCode, Radio, Route, Save, ScanLine, ShieldCheck,
-  Trash2, UserRound, Wrench, X,
+  KeyRound, LogOut, PenLine, Plus, QrCode, Radio, Route, Save, ScanLine, ShieldCheck,
+  Trash2, UserRound, UsersRound, Wrench, X,
 } from 'lucide-react';
 
-type Page = 'scan' | 'queue' | 'flow' | 'engineering' | 'projects';
+type Page = 'scan' | 'flow' | 'engineering' | 'projects' | 'access';
 type RoleId = 'operator' | 'qc' | 'production' | 'packaging' | 'engineering';
+type PermissionId = 'projects' | 'project_create' | 'engineering' | 'production_flow' | 'scanner' | 'qc' | 'production_control' | 'packaging' | 'access_matrix';
 type Step = { id: string; name: string; execution: 'internal' | 'external'; qcRequired: boolean; productionControlRequired: boolean; barcodeAfter: boolean };
 type ProductionSet = { id: string; name: string; code: string; kind: 'single' | 'assembly'; operatorRole: string; steps: Step[] };
 type Project = { id: string; name: string; code: string; itemType: 'single' | 'assembly'; drawings: string[]; sets: ProductionSet[] };
-type SessionUser = { username: string; displayName: string; role: RoleId; accountRole?: 'admin'; scope?: string | null };
+type SessionUser = { username: string; displayName: string; role: RoleId; accountRole?: 'admin'; scope?: string | null; permissions: PermissionId[] };
+type AccessUser = { username: string; displayName: string; role: RoleId | 'admin'; scope: string; permissions: PermissionId[]; isAdmin: boolean };
 type ScanResolution = {
   code: string; project: { id: string; code: string; name: string }; set: { id: string; code: string; name: string };
   step: { id: string; name: string } | null; serialNumber: string; status: string; executionStatus: string | null;
@@ -29,12 +31,16 @@ const roles = [
 ];
 
 const nav = [
-  { id: 'scan' as const, title: 'اسکن', icon: ScanLine },
-  { id: 'queue' as const, title: 'صف کار', icon: ClipboardList },
+  { id: 'scan' as const, title: 'ایستگاه اسکن', icon: ScanLine },
   { id: 'flow' as const, title: 'جریان تولید', icon: Activity },
   { id: 'engineering' as const, title: 'مهندسی', icon: Route },
   { id: 'projects' as const, title: 'پروژه‌ها', icon: FolderKanban },
+  { id: 'access' as const, title: 'ماتریس دسترسی', icon: KeyRound },
 ];
+
+const pagePermissions: Record<Page, PermissionId> = {
+  scan: 'scanner', flow: 'production_flow', engineering: 'engineering', projects: 'projects', access: 'access_matrix',
+};
 
 const uid = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
 const adminRoleKey = 'wpmes_admin_active_role';
@@ -46,6 +52,13 @@ function apiFetch(input: RequestInfo | URL, init: RequestInit = {}) {
   return fetch(input, { ...init, headers });
 }
 
+function firstPageFor(user: SessionUser): Page {
+  const allowed = user.accountRole === 'admin' ? nav : nav.filter((item) => user.permissions?.includes(pagePermissions[item.id]));
+  if (user.role === 'engineering' && allowed.some((item) => item.id === 'projects')) return 'projects';
+  if (allowed.some((item) => item.id === 'scan')) return 'scan';
+  return allowed[0]?.id || 'projects';
+}
+
 export default function AppV3() {
   const [page, setPage] = useState<Page>('engineering');
   const [railOpen, setRailOpen] = useState(false);
@@ -55,9 +68,9 @@ export default function AppV3() {
   const [toast, setToast] = useState<string | null>(null);
   const [time, setTime] = useState(() => new Date());
   const role = roles.find((item) => item.id === session?.role) || roles[0];
-  const visibleNav = session?.role === 'engineering'
-    ? nav.filter((item) => ['engineering', 'projects', 'flow'].includes(item.id))
-    : nav.filter((item) => ['scan', 'queue', 'flow'].includes(item.id));
+  const visibleNav = session
+    ? (session.accountRole === 'admin' ? nav : nav.filter((item) => item.id !== 'engineering' && session.permissions?.includes(pagePermissions[item.id])))
+    : [];
 
   useEffect(() => {
     const timer = window.setInterval(() => setTime(new Date()), 30_000);
@@ -71,7 +84,7 @@ export default function AppV3() {
     ]).then(([sessionData, projectData]) => {
       setSession(sessionData.user);
       setProjects((projectData.projects || []).map((project: Project) => ({ ...project, sets: Array.isArray(project.sets) ? project.sets : [] })));
-      setPage(sessionData.user?.role === 'engineering' ? 'engineering' : 'scan');
+      setPage(firstPageFor(sessionData.user));
     }).catch(() => { window.location.reload(); });
   }, []);
 
@@ -86,7 +99,7 @@ export default function AppV3() {
     if (session?.accountRole !== 'admin') return;
     window.sessionStorage.setItem(adminRoleKey, nextRole);
     setSession({ ...session, role: nextRole });
-    setPage(nextRole === 'engineering' ? 'engineering' : 'scan');
+    setPage(nextRole === 'engineering' ? 'projects' : 'scan');
   };
 
   if (!session) return <div className="forge-loading" dir="rtl"><span className="forge-mark"><i /><i /><i /></span><b>در حال آماده‌سازی فضای کاری</b></div>;
@@ -109,10 +122,10 @@ export default function AppV3() {
 
       <main className="forge-main">
         {page === 'scan' && <ScanPage role={role} />}
-        {page === 'queue' && <EmptyPage eyebrow="صف عملیات" title="صف کاری وجود ندارد" text="پس از تعریف پروژه و ورود قطعات به مسیر تولید، موارد قابل اقدام در این بخش نمایش داده می‌شوند." icon={<ClipboardList size={32} />} />}
         {page === 'flow' && <FlowPage projects={projects} onProjects={() => navigate('projects')} />}
         {page === 'engineering' && <EngineeringPage projects={projects} requestedProjectId={engineeringProjectId} onProjects={setProjects} notify={notify} onCreateProject={() => navigate('projects')} />}
-        {page === 'projects' && <ProjectsPage projects={projects} onProjects={setProjects} notify={notify} onDesignRoute={(project) => { setEngineeringProjectId(project.id); navigate('engineering'); }} />}
+        {page === 'projects' && <ProjectsPage projects={projects} onProjects={setProjects} notify={notify} canManage={session.accountRole === 'admin' || session.permissions.includes('project_create')} canEngineer={session.accountRole === 'admin' || session.permissions.includes('engineering')} onDesignRoute={(project) => { setEngineeringProjectId(project.id); navigate('engineering'); }} />}
+        {page === 'access' && session.accountRole === 'admin' && <AccessMatrixPage notify={notify} />}
       </main>
       <nav className="forge-dock">{visibleNav.map((item) => { const Icon = item.icon; return <button type="button" key={item.id} className={page === item.id ? 'active' : ''} onClick={() => navigate(item.id)}><Icon size={19} /><span>{item.title}</span></button>; })}</nav>
     </section>
@@ -166,7 +179,7 @@ function ScanPage({ role }: { role: (typeof roles)[number] }) {
       {!result && <div className="scan-core">
         <div className="scanner-art"><div className="scanner-grid" /><div className="scanner-ring one" /><div className="scanner-ring two" /><div className="scanner-glyph"><QrCode size={62} strokeWidth={1.35} /></div><span className="scanner-beam" /></div>
         <div className="scan-copy"><span>آماده اسکن</span><h2>کد QR را داخل قاب قرار دهید</h2></div>
-        <button className="camera-primary" type="button" onClick={() => setCameraOpen(true)} disabled={busy}><Camera size={20} /><span>باز کردن دوربین</span><ArrowLeft size={18} /></button>
+        <button className={`camera-primary ${role.id === 'qc' ? 'qc-primary' : ''}`} type="button" onClick={() => setCameraOpen(true)} disabled={busy}><Camera size={20} /><span>{role.id === 'qc' ? 'اسکن برای کنترل کیفیت' : 'باز کردن بارکدخوان'}</span><ArrowLeft size={18} /></button>
         <div className="scan-alternatives"><form onSubmit={usbSubmit}><Barcode size={18} /><input value={usbCode} onChange={(event) => setUsbCode(event.target.value)} placeholder="بارکدخوان رومیزی" /><kbd>Enter</kbd></form><button type="button" onClick={() => setManualOpen(true)}><PenLine size={17} /><span>ورود دستی</span></button></div>
       </div>}
       {result && <div className={`scan-result ${result.found && result.scan?.allowed ? 'found' : 'missing'}`}><span className="result-icon">{result.confirmed || (result.found && result.scan?.allowed) ? <CircleCheck size={32} /> : <CircleAlert size={32} />}</span><small>کد خوانده‌شده</small><h2>{result.code}</h2>{result.scan && <div className="scan-resolved-card"><span><small>پروژه</small><b>{result.scan.project.name}</b></span><span><small>مجموعه</small><b>{result.scan.set.name}</b></span><span><small>مرحله جاری</small><b>{result.scan.step?.name || 'پایان مسیر'}</b></span><span><small>شماره سریال</small><b>{result.scan.serialNumber}</b></span></div>}<p>{result.message}</p><div className="scan-result-actions">{result.scan?.allowed && !result.confirmed && <><button className="confirm-scan" type="button" onClick={() => void confirm()} disabled={busy}><CircleCheck size={17} /> {busy ? 'در حال ثبت' : result.scan.action?.title}</button>{role.id === 'qc' && result.scan.action?.code === 'QC_APPROVE' && <button className="reject-scan" type="button" onClick={() => setReworkOpen(true)} disabled={busy}><CircleAlert size={17} /> رد و تعیین بازکاری</button>}</>}<button type="button" onClick={() => setResult(null)}><ScanLine size={17} /> اسکن کد دیگر</button></div></div>}
@@ -219,8 +232,8 @@ function ManualEntry({ onClose, onDone }: { onClose: () => void; onDone: (code: 
 
 function ReworkDecisionModal({ onClose, onSubmit }: { onClose: () => void; onSubmit: (mode: 'same_step' | 'independent', comment: string) => void }) {
   const [mode, setMode] = useState<'same_step' | 'independent'>('same_step');
-  const [comment, setComment] = useState('');
-  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal rework-modal"><header><div><span>تصمیم کنترل کیفیت</span><h2>رد قطعه و تعیین مسیر بازکاری</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><p className="rework-intro">نوع بازکاری را بر اساس وضعیت واقعی قطعه مشخص کنید. سابقه عملیات قبلی حفظ خواهد شد.</p><div className="rework-options"><button type="button" className={mode === 'same_step' ? 'active' : ''} onClick={() => setMode('same_step')}><span className="rework-option-icon"><Route size={21} /></span><span><b>بازگشت به همین مجموعه</b><small>قطعه برای تعمیر مجدد به اپراتور همین مرحله برمی‌گردد.</small></span><i>{mode === 'same_step' && <CircleCheck size={16} />}</i></button><button type="button" className={mode === 'independent' ? 'active' : ''} onClick={() => setMode('independent')}><span className="rework-option-icon"><Wrench size={21} /></span><span><b>بازکاری مستقل</b><small>قطعه متوقف و برای تعیین مسیر بازکاری جداگانه ارجاع می‌شود.</small></span><i>{mode === 'independent' && <CircleCheck size={16} />}</i></button></div><label>شرح علت رد و اقدام موردنیاز<textarea autoFocus value={comment} onChange={(event) => setComment(event.target.value)} rows={4} placeholder="شرح دقیق ایراد مشاهده‌شده را ثبت کنید" /></label><footer><button type="button" onClick={onClose}>انصراف</button><button className="danger" type="button" disabled={comment.trim().length < 3} onClick={() => onSubmit(mode, comment.trim())}>ثبت رد و ارجاع</button></footer></section></div>;
+  const submit = () => onSubmit(mode, mode === 'same_step' ? 'بازگشت به همان مجموعه و رفع ایراد' : 'ارجاع به فرآیند بازکاری مستقل');
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal rework-modal"><header><div><span>تصمیم کنترل کیفیت</span><h2>مسیر قطعه پس از رد QC</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><p className="rework-intro">فقط یکی از دو مسیر زیر را انتخاب کنید.</p><div className="rework-options"><button type="button" className={mode === 'same_step' ? 'active' : ''} onClick={() => setMode('same_step')}><span className="rework-option-icon"><Route size={21} /></span><span><b>بازگشت به همین مجموعه</b><small>رفع ایراد توسط اپراتور همین مرحله و کنترل مجدد QC</small></span><i>{mode === 'same_step' && <CircleCheck size={16} />}</i></button><button type="button" className={mode === 'independent' ? 'active' : ''} onClick={() => setMode('independent')}><span className="rework-option-icon"><Wrench size={21} /></span><span><b>بازکاری مستقل</b><small>توقف مسیر جاری و ارجاع برای تعریف فرآیند بازکاری جداگانه</small></span><i>{mode === 'independent' && <CircleCheck size={16} />}</i></button></div><footer><button type="button" onClick={onClose}>انصراف</button><button className="danger" type="button" onClick={submit}>ثبت رد و ارجاع</button></footer></section></div>;
 }
 
 function EmptyPage({ eyebrow, title, text, icon, action }: { eyebrow: string; title: string; text: string; icon: React.ReactNode; action?: React.ReactNode }) {
@@ -234,6 +247,93 @@ function EmptyCanvas({ title, text, icon, action }: { title: string; text: strin
 function FlowPage({ projects, onProjects }: { projects: Project[]; onProjects: () => void }) {
   if (!projects.length) return <EmptyPage eyebrow="جریان تولید" title="هنوز جریانی ساخته نشده" text="ابتدا پروژه را تعریف کنید؛ مسیر واقعی همان پروژه در این بخش تشکیل می‌شود." icon={<Activity size={32} />} action={<button className="empty-action" type="button" onClick={onProjects}><FilePlus2 size={17} /> تعریف پروژه</button>} />;
   return <><PageHeader eyebrow="جریان تولید" title="پروژه‌های ثبت‌شده" /><section className="entity-grid">{projects.map((project) => <article className="entity-card" key={project.id}><span className="entity-icon"><FolderKanban size={22} /></span><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p></article>)}</section></>;
+}
+
+const permissionOptions: Array<{ id: PermissionId; title: string; group: string }> = [
+  { id: 'projects', title: 'مشاهده پروژه‌ها', group: 'پروژه' },
+  { id: 'project_create', title: 'تعریف و حذف پروژه', group: 'پروژه' },
+  { id: 'engineering', title: 'تعریف مسیر مهندسی', group: 'مهندسی' },
+  { id: 'production_flow', title: 'جریان تولید', group: 'گزارش' },
+  { id: 'scanner', title: 'ایستگاه اسکن', group: 'عملیات' },
+  { id: 'qc', title: 'تأیید کنترل کیفیت', group: 'عملیات' },
+  { id: 'production_control', title: 'تأیید کنترل تولید', group: 'عملیات' },
+  { id: 'packaging', title: 'ثبت پکیجینگ', group: 'عملیات' },
+];
+
+function AccessMatrixPage({ notify }: { notify: (message: string) => void }) {
+  const [users, setUsers] = useState<AccessUser[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [saving, setSaving] = useState(false);
+  const [newUserOpen, setNewUserOpen] = useState(false);
+  useEffect(() => {
+    apiFetch('/api/admin/access-matrix').then(async (response) => {
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error);
+      setUsers(data.users || []);
+    }).catch(() => notify('ماتریس دسترسی دریافت نشد.')).finally(() => setLoading(false));
+  }, []);
+  const patchUser = (username: string, patch: Partial<AccessUser>) => setUsers((current) => current.map((user) => user.username === username ? { ...user, ...patch } : user));
+  const changeRole = (user: AccessUser, role: RoleId) => {
+    let permissions = [...user.permissions];
+    const operational: PermissionId[] = ['qc', 'production_control', 'packaging'];
+    permissions = permissions.filter((permission) => !operational.includes(permission));
+    if (role === 'qc') permissions.push('scanner', 'qc');
+    if (role === 'production') permissions.push('scanner', 'production_control');
+    if (role === 'packaging') permissions.push('scanner', 'packaging');
+    if (role === 'operator') permissions.push('scanner');
+    if (role === 'engineering') permissions.push('projects', 'engineering');
+    patchUser(user.username, { role, permissions: [...new Set(permissions)] });
+  };
+  const togglePermission = (user: AccessUser, permission: PermissionId) => {
+    const enabled = user.permissions.includes(permission);
+    let permissions = enabled ? user.permissions.filter((item) => item !== permission) : [...user.permissions, permission];
+    let role = user.role;
+    if (!enabled && permission === 'project_create') permissions = [...permissions, 'projects'];
+    if (!enabled && permission === 'engineering') { role = 'engineering'; permissions = [...permissions, 'projects']; }
+    if (!enabled && permission === 'qc') { role = 'qc'; permissions = [...permissions, 'scanner']; }
+    if (!enabled && permission === 'production_control') { role = 'production'; permissions = [...permissions, 'scanner']; }
+    if (!enabled && permission === 'packaging') { role = 'packaging'; permissions = [...permissions, 'scanner']; }
+    if (permission === 'projects' && enabled) permissions = permissions.filter((item) => !['project_create', 'engineering'].includes(item));
+    if (permission === 'scanner' && enabled) { role = 'operator'; permissions = permissions.filter((item) => !['qc', 'production_control', 'packaging'].includes(item)); }
+    if (enabled && permission === 'qc' && role === 'qc') role = 'operator';
+    if (enabled && permission === 'production_control' && role === 'production') role = 'operator';
+    if (enabled && permission === 'packaging' && role === 'packaging') role = 'operator';
+    patchUser(user.username, { role, permissions: [...new Set(permissions)] });
+  };
+  const save = async () => {
+    setSaving(true);
+    try {
+      const response = await apiFetch('/api/admin/access-matrix', { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ users }) });
+      const data = await response.json();
+      if (!response.ok) { notify(data.error || 'دسترسی‌ها ذخیره نشد.'); return; }
+      setUsers(data.users || users); notify('ماتریس دسترسی کاربران ذخیره شد.');
+    } finally { setSaving(false); }
+  };
+  const createUser = async (input: { username: string; displayName: string; password: string; role: RoleId }) => {
+    const response = await apiFetch('/api/admin/users', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) });
+    const data = await response.json();
+    if (!response.ok) { notify(data.error || 'کاربر ایجاد نشد.'); return; }
+    setUsers((current) => [...current, data.user]); setNewUserOpen(false); notify('کاربر محلی ایجاد شد؛ دسترسی‌های او را در همین صفحه تنظیم کنید.');
+  };
+  return <>
+    <PageHeader eyebrow="مدیریت سامانه" title="ماتریس دسترسی کاربران"><div className="access-heading-actions"><button className="heading-action secondary" type="button" onClick={() => setNewUserOpen(true)}><Plus size={17} /> کاربر محلی جدید</button><button className="heading-action access-save" type="button" onClick={() => void save()} disabled={saving}><Save size={17} /> {saving ? 'در حال ذخیره' : 'ذخیره دسترسی‌ها'}</button></div></PageHeader>
+    <section className="access-overview"><div><span className="access-overview-icon"><ShieldCheck size={23} /></span><span><b>کنترل نقش‌محور ماژول‌ها</b><small>هر کاربر فقط ماژول‌های مجاز خود را می‌بیند و مفهوم اسکن از نقش عملیاتی او تعیین می‌شود.</small></span></div><div className="access-legend"><span><i className="green" />فعال</span><span><i />غیرفعال</span></div></section>
+    {loading ? <section className="access-loading">در حال دریافت کاربران…</section> : <section className="access-matrix">
+      {users.map((user) => <article className={`access-user ${user.isAdmin ? 'system-admin' : ''}`} key={user.username}>
+        <header><span className="access-avatar"><UserRound size={19} /></span><span><b>{user.displayName}</b><small>{user.username}</small></span>{user.isAdmin && <em><KeyRound size={13} /> مدیر کل</em>}</header>
+        <div className="access-role"><label>نقش عملیاتی<select value={user.role} disabled={user.isAdmin} onChange={(event) => changeRole(user, event.target.value as RoleId)}>{user.isAdmin ? <option value="admin">مدیر کل سامانه</option> : roles.map((role) => <option key={role.id} value={role.id}>{role.title}</option>)}</select></label><span><small>مفهوم بارکدخوان</small><b>{user.isAdmin ? 'تمام عملیات‌ها' : roles.find((role) => role.id === user.role)?.action}</b></span></div>
+        <div className="access-permissions">{permissionOptions.map((permission) => { const active = user.isAdmin || user.permissions.includes(permission.id); return <button type="button" key={permission.id} disabled={user.isAdmin} className={active ? 'active' : ''} onClick={() => togglePermission(user, permission.id)}><span>{active ? <Check size={14} /> : null}</span><b>{permission.title}</b><small>{permission.group}</small></button>; })}</div>
+        {!user.isAdmin && user.role === 'operator' && <label className="operator-scope"><span>حوزه اپراتور / نام مجموعه مسئول</span><input value={user.scope} onChange={(event) => patchUser(user.username, { scope: event.target.value })} placeholder="مثلاً: جوش یا مونتاژ" /></label>}
+      </article>)}
+      {!users.length && <div className="access-loading"><UsersRound size={28} /> کاربری برای تخصیص دسترسی ثبت نشده است.</div>}
+    </section>}
+    {newUserOpen && <NewAccessUserModal onClose={() => setNewUserOpen(false)} onCreate={(input) => void createUser(input)} />}
+  </>;
+}
+
+function NewAccessUserModal({ onClose, onCreate }: { onClose: () => void; onCreate: (input: { username: string; displayName: string; password: string; role: RoleId }) => void }) {
+  const [displayName, setDisplayName] = useState(''); const [username, setUsername] = useState(''); const [password, setPassword] = useState(''); const [role, setRole] = useState<RoleId>('operator');
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal"><header><div><span>هویت محلی سامانه</span><h2>ایجاد کاربر جدید</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><div className="modal-grid"><label>نام و نام خانوادگی<input autoFocus value={displayName} onChange={(event) => setDisplayName(event.target.value)} placeholder="نام نمایشی کاربر" /></label><label>نام کاربری انگلیسی<input dir="ltr" value={username} onChange={(event) => setUsername(event.target.value.toLowerCase().replace(/[^a-z0-9._-]/g, ''))} placeholder="username" /></label></div><div className="modal-grid"><label>نقش عملیاتی<select value={role} onChange={(event) => setRole(event.target.value as RoleId)}>{roles.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></label><label>رمز عبور اولیه<input dir="ltr" type="password" value={password} onChange={(event) => setPassword(event.target.value)} placeholder="حداقل ۱۰ کاراکتر" /></label></div><div className="modal-assurance"><ShieldCheck size={18} /><span><b>رمز عبور به‌صورت Hash ذخیره می‌شود</b><small>پس از ایجاد کاربر، مجوزهای دقیق او را از ماتریس همین صفحه تعیین کنید.</small></span></div><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={displayName.trim().length < 2 || username.length < 3 || password.length < 10} onClick={() => onCreate({ displayName: displayName.trim(), username, password, role })}>ایجاد کاربر</button></footer></section></div>;
 }
 
 function EngineeringPage({ projects, requestedProjectId, onProjects, notify, onCreateProject }: { projects: Project[]; requestedProjectId: string | null; onProjects: (projects: Project[]) => void; notify: (message: string) => void; onCreateProject: () => void }) {
@@ -268,9 +368,9 @@ function EngineeringPage({ projects, requestedProjectId, onProjects, notify, onC
     if (!draft || !selectedSetId) return;
     setDraft({ ...draft, sets: draft.sets.map((set) => set.id === selectedSetId ? { ...set, ...patch } : set) });
   };
-  const createSet = (input: Pick<ProductionSet, 'name' | 'code' | 'operatorRole'>) => {
+  const createSet = (input: Pick<ProductionSet, 'name' | 'code'>) => {
     if (!draft) return;
-    const set: ProductionSet = { id: uid(), ...input, kind: draft.itemType, steps: [] };
+    const set: ProductionSet = { id: uid(), ...input, operatorRole: input.name, kind: draft.itemType, steps: [{ id: uid(), name: input.name, execution: 'internal', qcRequired: true, productionControlRequired: true, barcodeAfter: false }] };
     setDraft({ ...draft, sets: [...draft.sets, set] }); setSelectedSetId(set.id); setNewSetOpen(false); notify('مجموعه به مسیر پروژه اضافه شد؛ چینش را ذخیره کنید.');
   };
   const moveSet = (index: number, delta: number) => {
@@ -312,7 +412,7 @@ function EngineeringPage({ projects, requestedProjectId, onProjects, notify, onC
     try {
       const response = await apiFetch(`/api/projects/${draft.id}/route`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sets: draft.sets }) });
       const data = await response.json(); if (!response.ok) { notify(data.error || 'چینش پروژه ذخیره نشد.'); return; }
-      onProjects(projects.map((project) => project.id === draft.id ? data.project : project)); setDraft(structuredClone(data.project)); notify('مسیر پروژه ذخیره شد.');
+      onProjects(projects.map((project) => project.id === draft.id ? data.project : project)); setDraft(structuredClone(data.project)); notify('مسیر ذخیره شد؛ پروژه آماده صدور QR و ورود به چرخه تولید است.');
     } finally { setSaving(false); }
   };
 
@@ -333,17 +433,23 @@ function EngineeringPage({ projects, requestedProjectId, onProjects, notify, onC
   </>;
 }
 
-function NewSetModal({ onClose, onCreate }: { onClose: () => void; onCreate: (value: Pick<ProductionSet, 'name' | 'code' | 'operatorRole'>) => void }) {
-  const [name, setName] = useState(''); const [code, setCode] = useState(''); const [operatorRole, setOperatorRole] = useState('');
-  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal"><header><div><span>مسیر تولید پروژه</span><h2>تعریف مجموعه جدید</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><div className="modal-grid"><label>نام مجموعه<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="برای مثال: جوش یا پکیجینگ" /></label><label>کد مجموعه <em>اختیاری</em><input value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="کد داخلی" /></label></div><label>نقش اپراتور مسئول<input value={operatorRole} onChange={(event) => setOperatorRole(event.target.value)} placeholder="عنوان نقش مسئول این مجموعه" /></label><div className="modal-assurance"><ShieldCheck size={18} /><span><b>مسیر کنترل به‌صورت خودکار اعمال می‌شود</b><small>پس از عملیات اپراتور، تأیید QC و کنترل تولید الزامی خواهد بود.</small></span></div><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={name.trim().length < 2 || operatorRole.trim().length < 2} onClick={() => onCreate({ name: name.trim(), code: code.trim(), operatorRole: operatorRole.trim() })}>افزودن به مسیر</button></footer></section></div>;
+function NewSetModal({ onClose, onCreate }: { onClose: () => void; onCreate: (value: Pick<ProductionSet, 'name' | 'code'>) => void }) {
+  const [name, setName] = useState(''); const [code, setCode] = useState('');
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal set-quick-modal"><header><div><span>مسیر تولید پروژه</span><h2>افزودن مجموعه به مسیر</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><div className="set-modal-number"><span>۱</span><div><b>نام مجموعه را وارد کنید</b><small>مرحله اولیه و کنترل‌های QC و کنترل تولید به‌صورت خودکار ساخته می‌شوند.</small></div></div><div className="modal-grid"><label>نام مجموعه<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="مثلاً: مونتاژ، جوش یا پکیجینگ" /></label><label>کد مجموعه <em>اختیاری</em><input value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="در صورت وجود" /></label></div><div className="modal-assurance"><ShieldCheck size={18} /><span><b>اپراتور همین مجموعه تعیین می‌شود</b><small>بارکدخوان اپراتور مفهوم «اتمام {name || 'این مجموعه'}» خواهد داشت.</small></span></div><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={name.trim().length < 2} onClick={() => onCreate({ name: name.trim(), code: code.trim() })}><Plus size={15} /> افزودن به انتهای مسیر</button></footer></section></div>;
 }
 
-function ProjectsPage({ projects, onProjects, notify, onDesignRoute }: { projects: Project[]; onProjects: (projects: Project[]) => void; notify: (message: string) => void; onDesignRoute: (project: Project) => void }) {
+function ProjectsPage({ projects, onProjects, notify, onDesignRoute, canManage, canEngineer }: { projects: Project[]; onProjects: (projects: Project[]) => void; notify: (message: string) => void; onDesignRoute: (project: Project) => void; canManage: boolean; canEngineer: boolean }) {
   const [open, setOpen] = useState(false);
   const [issueProject, setIssueProject] = useState<Project | null>(null);
+  const [deleteProject, setDeleteProject] = useState<Project | null>(null);
   const create = async (input: Omit<Project, 'id' | 'sets'>) => { const response = await apiFetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'پروژه ذخیره نشد.'); return; } onProjects([...projects, data.project]); setOpen(false); notify('پروژه ایجاد شد؛ اکنون مسیر آن را در مهندسی تعریف کنید.'); };
   const issue = async (input: { projectId: string; serialNumber: string; barcode: string }) => { const response = await apiFetch('/api/work-items', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'شناسه تولید صادر نشد.'); return; } setIssueProject(null); notify(`بارکد ${data.item.barcode} برای کل مجموعه صادر شد.`); };
-  return <><PageHeader eyebrow="دفتر پروژه‌ها" title="پروژه‌ها"><button className="heading-action" type="button" onClick={() => setOpen(true)}><Plus size={18} /> پروژه جدید</button></PageHeader>{projects.length ? <section className="entity-grid">{projects.map((project) => <article className="entity-card project-card" key={project.id}><div className="project-card-top"><span className="entity-icon"><Factory size={22} /></span><span className={`route-state ${project.sets?.length ? 'ready' : ''}`}>{project.sets?.length ? 'مسیر تعریف شده' : 'در انتظار تعریف مسیر'}</span></div><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p><div className="project-route-preview">{project.sets?.length ? project.sets.slice(0, 4).map((set, index) => <span key={set.id}><b>{(index + 1).toLocaleString('fa-IR')}</b>{set.name}</span>) : <span className="empty-preview">مسیر تولید هنوز چیده نشده است</span>}</div><div className="entity-card-actions dual"><button className="design-route" type="button" onClick={() => onDesignRoute(project)}><Route size={15} /> {project.sets?.length ? 'ویرایش مجموعه‌ها' : 'تعریف مجموعه‌ها'}</button><button type="button" disabled={!project.sets?.length} onClick={() => setIssueProject(project)}><Barcode size={15} /> صدور QR</button></div></article>)}</section> : <EmptyCanvas title="پروژه‌ای ثبت نشده" text="نام پروژه، کد، نقشه‌ها و نوع ساخت را ثبت کنید." icon={<FolderKanban size={32} />} action={<button className="empty-action" type="button" onClick={() => setOpen(true)}><Plus size={17} /> تعریف اولین پروژه</button>} />}{open && <NewProjectModal onClose={() => setOpen(false)} onCreate={(input) => void create(input)} />}{issueProject && <IssueWorkItemModal project={issueProject} onClose={() => setIssueProject(null)} onIssue={(input) => void issue(input)} />}</>;
+  const remove = async (project: Project) => { const response = await apiFetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' }); const data = await response.json(); if (!response.ok) { notify(data.error || 'پروژه حذف نشد.'); return; } onProjects(projects.filter((item) => item.id !== project.id)); setDeleteProject(null); notify(`پروژه «${project.name}» حذف شد.`); };
+  return <><PageHeader eyebrow="دفتر پروژه‌ها" title="پروژه‌ها">{canManage && <button className="heading-action" type="button" onClick={() => setOpen(true)}><Plus size={18} /> پروژه جدید</button>}</PageHeader>{projects.length ? <section className="entity-grid">{projects.map((project) => <article className="entity-card project-card" key={project.id}><div className="project-card-top"><span className="entity-icon"><Factory size={22} /></span><span className={`route-state ${project.sets?.length ? 'ready' : ''}`}>{project.sets?.length ? 'مسیر تعریف شده' : 'در انتظار تعریف مسیر'}</span></div><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p><div className="project-route-preview">{project.sets?.length ? project.sets.slice(0, 4).map((set, index) => <span key={set.id}><b>{(index + 1).toLocaleString('fa-IR')}</b>{set.name}</span>) : <span className="empty-preview">مسیر تولید هنوز چیده نشده است</span>}</div><div className="entity-card-actions project-actions">{canEngineer && <button className="design-route" type="button" onClick={() => onDesignRoute(project)}><Route size={15} /> {project.sets?.length ? 'ویرایش مجموعه‌ها' : 'تعریف مجموعه‌ها'}</button>}{canEngineer && <button type="button" disabled={!project.sets?.length} onClick={() => setIssueProject(project)}><Barcode size={15} /> صدور QR</button>}{canManage && <button className="danger-action" type="button" onClick={() => setDeleteProject(project)}><Trash2 size={15} /> حذف</button>}</div></article>)}</section> : <EmptyCanvas title="پروژه‌ای ثبت نشده" text="نام پروژه، کد، نقشه‌ها و نوع ساخت را ثبت کنید." icon={<FolderKanban size={32} />} action={canManage ? <button className="empty-action" type="button" onClick={() => setOpen(true)}><Plus size={17} /> تعریف اولین پروژه</button> : undefined} />}{open && <NewProjectModal onClose={() => setOpen(false)} onCreate={(input) => void create(input)} />}{issueProject && <IssueWorkItemModal project={issueProject} onClose={() => setIssueProject(null)} onIssue={(input) => void issue(input)} />}{deleteProject && <DeleteProjectModal project={deleteProject} onClose={() => setDeleteProject(null)} onDelete={() => void remove(deleteProject)} />}</>;
+}
+
+function DeleteProjectModal({ project, onClose, onDelete }: { project: Project; onClose: () => void; onDelete: () => void }) {
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal small delete-project-modal"><header><div><span>حذف پروژه</span><h2>{project.name}</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><div className="delete-warning"><span><Trash2 size={23} /></span><div><b>این پروژه از سامانه حذف می‌شود</b><small>نقشه‌ها و مسیر مهندسی پروژه نیز حذف خواهند شد. پروژه‌ای که وارد تولید شده باشد قابل حذف نیست.</small></div></div><div className="delete-project-facts"><span><small>کد پروژه</small><b>{project.code}</b></span><span><small>تعداد مجموعه‌ها</small><b>{project.sets.length.toLocaleString('fa-IR')}</b></span></div><footer><button type="button" onClick={onClose}>انصراف</button><button className="danger" type="button" onClick={onDelete}><Trash2 size={15} /> حذف پروژه</button></footer></section></div>;
 }
 
 function IssueWorkItemModal({ project, onClose, onIssue }: { project: Project; onClose: () => void; onIssue: (value: { projectId: string; serialNumber: string; barcode: string }) => void }) {
