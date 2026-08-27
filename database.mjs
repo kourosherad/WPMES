@@ -303,7 +303,7 @@ function actionFor(context, actor) {
   if (!context) return { allowed: false, reason: 'BARCODE_NOT_FOUND' };
   if (actor.role === 'operator') {
     if (!actor.scope) return { allowed: false, reason: 'OPERATOR_ASSIGNMENT_REQUIRED' };
-    if (String(actor.scope).trim().toLocaleLowerCase('fa') !== String(context.OperatorRoleKey || '').trim().toLocaleLowerCase('fa')) return { allowed: false, reason: 'OPERATOR_NOT_ASSIGNED' };
+    if (actor.accountRole !== 'admin' && String(actor.scope).trim().toLocaleLowerCase('fa') !== String(context.OperatorRoleKey || '').trim().toLocaleLowerCase('fa')) return { allowed: false, reason: 'OPERATOR_NOT_ASSIGNED' };
     if (!['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)) return { allowed: false, reason: 'STEP_NOT_READY' };
     return { allowed: true, code: 'OPERATOR_COMPLETE', title: `ثبت اتمام «${context.SetName}»` };
   }

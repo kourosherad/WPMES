@@ -13,7 +13,7 @@ type RoleId = 'operator' | 'qc' | 'production' | 'packaging' | 'engineering';
 type Step = { id: string; name: string; execution: 'internal' | 'external'; qcRequired: boolean; productionControlRequired: boolean; barcodeAfter: boolean };
 type ProductionSet = { id: string; name: string; code: string; kind: 'single' | 'assembly'; operatorRole: string; steps: Step[] };
 type Project = { id: string; name: string; code: string; itemType: 'single' | 'assembly'; drawings: string[]; sets: ProductionSet[] };
-type SessionUser = { username: string; displayName: string; role: RoleId; scope?: string | null };
+type SessionUser = { username: string; displayName: string; role: RoleId; accountRole?: 'admin'; scope?: string | null };
 type ScanResolution = {
   code: string; project: { id: string; code: string; name: string }; set: { id: string; code: string; name: string };
   step: { id: string; name: string } | null; serialNumber: string; status: string; executionStatus: string | null;
@@ -37,6 +37,14 @@ const nav = [
 ];
 
 const uid = () => crypto.randomUUID?.() || `${Date.now()}-${Math.random()}`;
+const adminRoleKey = 'wpmes_admin_active_role';
+
+function apiFetch(input: RequestInfo | URL, init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  const activeRole = window.sessionStorage.getItem(adminRoleKey);
+  if (activeRole) headers.set('X-WPMES-Role', activeRole);
+  return fetch(input, { ...init, headers });
+}
 
 export default function AppV3() {
   const [page, setPage] = useState<Page>('engineering');
@@ -58,8 +66,8 @@ export default function AppV3() {
 
   useEffect(() => {
     Promise.all([
-      fetch('/api/auth/session').then((response) => response.ok ? response.json() : Promise.reject()),
-      fetch('/api/projects').then((response) => response.ok ? response.json() : { projects: [] }),
+      apiFetch('/api/auth/session').then((response) => response.ok ? response.json() : Promise.reject()),
+      apiFetch('/api/projects').then((response) => response.ok ? response.json() : { projects: [] }),
     ]).then(([sessionData, projectData]) => {
       setSession(sessionData.user);
       setProjects((projectData.projects || []).map((project: Project) => ({ ...project, sets: Array.isArray(project.sets) ? project.sets : [] })));
@@ -73,7 +81,13 @@ export default function AppV3() {
   };
 
   const navigate = (target: Page) => { setPage(target); setRailOpen(false); };
-  const logout = async () => { await fetch('/api/auth/logout', { method: 'POST' }); window.location.assign('/'); };
+  const logout = async () => { window.sessionStorage.removeItem(adminRoleKey); await apiFetch('/api/auth/logout', { method: 'POST' }); window.location.assign('/'); };
+  const switchAdminRole = (nextRole: RoleId) => {
+    if (session?.accountRole !== 'admin') return;
+    window.sessionStorage.setItem(adminRoleKey, nextRole);
+    setSession({ ...session, role: nextRole });
+    setPage(nextRole === 'engineering' ? 'engineering' : 'scan');
+  };
 
   if (!session) return <div className="forge-loading" dir="rtl"><span className="forge-mark"><i /><i /><i /></span><b>در حال آماده‌سازی فضای کاری</b></div>;
 
@@ -90,7 +104,7 @@ export default function AppV3() {
     <section className="forge-workspace">
       <header className="forge-topbar">
         <div className="topbar-title"><button className="menu-button" type="button" onClick={() => setRailOpen(true)}><Menu size={20} /></button><span>{nav.find((item) => item.id === page)?.title}</span></div>
-        <div className="topbar-actions"><div className="live-time"><i /><span>{time.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' })}</span></div><div className="identity-chip"><span className="role-avatar"><UserRound size={17} /></span><span><small>{role.title}</small><b>{session.displayName}</b></span></div><button className="logout-button" type="button" onClick={() => void logout()} aria-label="خروج از سامانه"><LogOut size={17} /></button></div>
+        <div className="topbar-actions"><div className="live-time"><i /><span>{time.toLocaleTimeString('fa-IR', { hour: '2-digit', minute: '2-digit' })}</span></div>{session.accountRole === 'admin' && <label className="admin-role-switch"><ShieldCheck size={16} /><span><small>نقش فعال مدیر</small><select value={session.role} onChange={(event) => switchAdminRole(event.target.value as RoleId)}>{roles.map((item) => <option key={item.id} value={item.id}>{item.title}</option>)}</select></span></label>}<div className="identity-chip"><span className="role-avatar"><UserRound size={17} /></span><span><small>{session.accountRole === 'admin' ? 'مدیر کل سامانه' : role.title}</small><b>{session.displayName}</b></span></div><button className="logout-button" type="button" onClick={() => void logout()} aria-label="خروج از سامانه"><LogOut size={17} /></button></div>
       </header>
 
       <main className="forge-main">
@@ -123,7 +137,7 @@ function ScanPage({ role }: { role: (typeof roles)[number] }) {
     if (code.length < 2) return;
     setBusy(true); setCameraOpen(false); setManualOpen(false);
     try {
-      const response = await fetch(`/api/scan/${encodeURIComponent(code)}`);
+      const response = await apiFetch(`/api/scan/${encodeURIComponent(code)}`);
       const data = await response.json();
       const scan = data.scan as ScanResolution | undefined;
       setResult({ code, found: response.ok, scan, inputSource, manualReason, message: response.ok ? (scan?.allowed ? scan.action?.title || 'کد آماده ثبت است.' : 'این کد برای نقش فعلی قابل اقدام نیست.') : data.error || 'رکوردی برای این کد ثبت نشده است.' });
@@ -135,7 +149,7 @@ function ScanPage({ role }: { role: (typeof roles)[number] }) {
     if (!result?.scan?.allowed) return;
     setBusy(true); setReworkOpen(false);
     try {
-      const response = await fetch('/api/scan/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: result.code, inputSource: result.inputSource, manualReason: result.manualReason, clientRequestId: crypto.randomUUID(), decision, reworkMode: rework?.mode, comment: rework?.comment }) });
+      const response = await apiFetch('/api/scan/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: result.code, inputSource: result.inputSource, manualReason: result.manualReason, clientRequestId: crypto.randomUUID(), decision, reworkMode: rework?.mode, comment: rework?.comment }) });
       const data = await response.json();
       if (!response.ok) { setResult({ ...result, message: data.error || 'عملیات ثبت نشد.' }); return; }
       setResult({ ...result, confirmed: true, scan: data.next || result.scan, message: data.duplicate ? 'این درخواست قبلاً ثبت شده است.' : `${data.action} با موفقیت ثبت شد.` });
@@ -296,7 +310,7 @@ function EngineeringPage({ projects, requestedProjectId, onProjects, notify, onC
   const save = async () => {
     if (!draft) return; setSaving(true);
     try {
-      const response = await fetch(`/api/projects/${draft.id}/route`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sets: draft.sets }) });
+      const response = await apiFetch(`/api/projects/${draft.id}/route`, { method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sets: draft.sets }) });
       const data = await response.json(); if (!response.ok) { notify(data.error || 'چینش پروژه ذخیره نشد.'); return; }
       onProjects(projects.map((project) => project.id === draft.id ? data.project : project)); setDraft(structuredClone(data.project)); notify('مسیر پروژه ذخیره شد.');
     } finally { setSaving(false); }
@@ -327,8 +341,8 @@ function NewSetModal({ onClose, onCreate }: { onClose: () => void; onCreate: (va
 function ProjectsPage({ projects, onProjects, notify, onDesignRoute }: { projects: Project[]; onProjects: (projects: Project[]) => void; notify: (message: string) => void; onDesignRoute: (project: Project) => void }) {
   const [open, setOpen] = useState(false);
   const [issueProject, setIssueProject] = useState<Project | null>(null);
-  const create = async (input: Omit<Project, 'id' | 'sets'>) => { const response = await fetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'پروژه ذخیره نشد.'); return; } onProjects([...projects, data.project]); setOpen(false); notify('پروژه ایجاد شد؛ اکنون مسیر آن را در مهندسی تعریف کنید.'); };
-  const issue = async (input: { projectId: string; serialNumber: string; barcode: string }) => { const response = await fetch('/api/work-items', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'شناسه تولید صادر نشد.'); return; } setIssueProject(null); notify(`بارکد ${data.item.barcode} برای کل مجموعه صادر شد.`); };
+  const create = async (input: Omit<Project, 'id' | 'sets'>) => { const response = await apiFetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'پروژه ذخیره نشد.'); return; } onProjects([...projects, data.project]); setOpen(false); notify('پروژه ایجاد شد؛ اکنون مسیر آن را در مهندسی تعریف کنید.'); };
+  const issue = async (input: { projectId: string; serialNumber: string; barcode: string }) => { const response = await apiFetch('/api/work-items', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'شناسه تولید صادر نشد.'); return; } setIssueProject(null); notify(`بارکد ${data.item.barcode} برای کل مجموعه صادر شد.`); };
   return <><PageHeader eyebrow="دفتر پروژه‌ها" title="پروژه‌ها"><button className="heading-action" type="button" onClick={() => setOpen(true)}><Plus size={18} /> پروژه جدید</button></PageHeader>{projects.length ? <section className="entity-grid">{projects.map((project) => <article className="entity-card project-card" key={project.id}><div className="project-card-top"><span className="entity-icon"><Factory size={22} /></span><span className={`route-state ${project.sets?.length ? 'ready' : ''}`}>{project.sets?.length ? 'مسیر تعریف شده' : 'در انتظار تعریف مسیر'}</span></div><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p><div className="project-route-preview">{project.sets?.length ? project.sets.slice(0, 4).map((set, index) => <span key={set.id}><b>{(index + 1).toLocaleString('fa-IR')}</b>{set.name}</span>) : <span className="empty-preview">مسیر تولید هنوز چیده نشده است</span>}</div><div className="entity-card-actions dual"><button className="design-route" type="button" onClick={() => onDesignRoute(project)}><Route size={15} /> {project.sets?.length ? 'ویرایش مجموعه‌ها' : 'تعریف مجموعه‌ها'}</button><button type="button" disabled={!project.sets?.length} onClick={() => setIssueProject(project)}><Barcode size={15} /> صدور QR</button></div></article>)}</section> : <EmptyCanvas title="پروژه‌ای ثبت نشده" text="نام پروژه، کد، نقشه‌ها و نوع ساخت را ثبت کنید." icon={<FolderKanban size={32} />} action={<button className="empty-action" type="button" onClick={() => setOpen(true)}><Plus size={17} /> تعریف اولین پروژه</button>} />}{open && <NewProjectModal onClose={() => setOpen(false)} onCreate={(input) => void create(input)} />}{issueProject && <IssueWorkItemModal project={issueProject} onClose={() => setIssueProject(null)} onIssue={(input) => void issue(input)} />}</>;
 }
 

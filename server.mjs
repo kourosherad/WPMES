@@ -78,6 +78,15 @@ function validSession(req, config) {
   return { username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || null };
 }
 
+const delegatedAdminRoles = new Set(['engineering', 'operator', 'qc', 'production', 'packaging']);
+
+function requestActor(session, req) {
+  if (session.role !== 'admin') return session;
+  const requestedRole = String(req.headers['x-wpmes-role'] || 'engineering').toLowerCase();
+  const role = delegatedAdminRoles.has(requestedRole) ? requestedRole : 'engineering';
+  return { ...session, role, accountRole: 'admin', scope: role === 'operator' ? '*' : session.scope };
+}
+
 function renderLogin(res, invalid = false) {
   const error = invalid ? '<p class="login-error">نام کاربری یا رمز عبور صحیح نیست.</p>' : '';
   res.writeHead(invalid ? 401 : 200, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' });
@@ -113,7 +122,7 @@ async function authorizePublicRequest(req, res, pathname, isSecure) {
     return false;
   }
   const session = validSession(req, config);
-  if (session) { req.authUser = session; return true; }
+  if (session) { req.authUser = requestActor(session, req); return true; }
   if (pathname.startsWith('/api/')) sendJson(res, 401, { error: 'نشست ورود معتبر نیست.' }); else renderLogin(res);
   return false;
 }
