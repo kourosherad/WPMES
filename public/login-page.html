@@ -1,0 +1,106 @@
+<!doctype html>
+<html lang="fa" dir="rtl">
+  <head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <meta name="theme-color" content="#0d1519">
+    <title>ورود به WPMES</title>
+    <link rel="stylesheet" href="/auth/login-signature-v4.css">
+  </head>
+  <body>
+    <main class="page-frame">
+      <section class="auth-shell">
+        <aside class="visual-panel" aria-label="نمایش مسیر اجرای تولید">
+          <header class="visual-header">
+            <div class="system-identity">
+              <span class="system-emblem" aria-hidden="true"><i></i><i></i><i></i></span>
+              <div>
+                <strong>WPMES</strong>
+                <small>Wagon Pars Manufacturing Execution System</small>
+              </div>
+            </div>
+            <span class="system-state"><i></i>سامانه اجرای تولید</span>
+          </header>
+
+          <div class="visual-content">
+            <div class="visual-title">
+              <span>PRODUCTION EXECUTION</span>
+              <h1>جریان عملیات تولید</h1>
+              <p>از تعریف مسیر مهندسی تا ثبت و تأیید مراحل اجرایی</p>
+            </div>
+
+            <div class="factory-stage" aria-hidden="true">
+              <div class="ambient-ring ring-one"></div>
+              <div class="ambient-ring ring-two"></div>
+              <div class="robot robot-left">
+                <span class="robot-base"></span><span class="robot-arm arm-one"></span><span class="robot-joint"></span><span class="robot-arm arm-two"></span><span class="robot-tool"></span>
+              </div>
+              <div class="robot robot-right">
+                <span class="robot-base"></span><span class="robot-arm arm-one"></span><span class="robot-joint"></span><span class="robot-arm arm-two"></span><span class="robot-tool"></span>
+              </div>
+              <div class="machine-light light-one"></div>
+              <div class="machine-light light-two"></div>
+              <div class="conveyor">
+                <div class="conveyor-surface"></div>
+                <div class="conveyor-track"></div>
+                <div class="rollers"></div>
+                <div class="carrier"><span class="part"></span><i></i></div>
+              </div>
+              <div class="scan-gate"><span></span><i></i><b></b></div>
+            </div>
+
+            <div class="process-strip" aria-hidden="true">
+              <div class="process-progress"></div>
+              <div class="process-item p1"><span>01</span><b>مهندسی</b><small>تعریف مسیر</small></div>
+              <div class="process-item p2"><span>02</span><b>عملیات</b><small>ثبت اجرا</small></div>
+              <div class="process-item p3"><span>03</span><b>کنترل کیفیت</b><small>تأیید QC</small></div>
+              <div class="process-item p4"><span>04</span><b>کنترل تولید</b><small>تأیید نهایی</small></div>
+              <div class="process-item p5"><span>05</span><b>تحویل</b><small>تکمیل مسیر</small></div>
+            </div>
+          </div>
+
+          <footer class="visual-footer">
+            <span>امور فناوری اطلاعات</span>
+            <span class="designer-sign"><i>AE</i><small>Designed &amp; Developed by</small><b>Ali Esfahani</b></span>
+          </footer>
+        </aside>
+
+        <section class="form-panel">
+          <div class="mobile-brand">
+            <span class="system-emblem" aria-hidden="true"><i></i><i></i><i></i></span>
+            <div><strong>WPMES</strong><small>Manufacturing Execution System</small></div>
+          </div>
+
+          <div class="login-content">
+            <div class="login-heading">
+              <span>درگاه کاربران</span>
+              <h2>ورود به سامانه</h2>
+              <p>نام کاربری و رمز عبور سازمانی خود را وارد کنید.</p>
+            </div>
+            {{ERROR}}
+            <form method="post" action="/auth/login">
+              <label>
+                <span>نام کاربری</span>
+                <div class="field">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 21a8 8 0 0 0-16 0M12 13a5 5 0 1 0 0-10 5 5 0 0 0 0 10Z"/></svg>
+                  <input name="username" autocomplete="username" placeholder="نام کاربری" required autofocus>
+                </div>
+              </label>
+              <label>
+                <span>رمز عبور</span>
+                <div class="field">
+                  <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="10" width="16" height="11" rx="3"/><path d="M8 10V7a4 4 0 0 1 8 0v3M12 15v2"/></svg>
+                  <input name="password" type="password" autocomplete="current-password" placeholder="رمز عبور" required>
+                </div>
+              </label>
+              <button type="submit"><span>ورود به سامانه</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="m9 18 6-6-6-6"/></svg></button>
+            </form>
+            <div class="access-note"><i></i><span>دسترسی سازمانی حفاظت‌شده</span></div>
+          </div>
+
+          <footer class="form-footer"><span>WPMES</span><b>نسخه فاز نخست</b></footer>
+        </section>
+      </section>
+    </main>
+  </body>
+</html>
