@@ -55,6 +55,7 @@ function apiFetch(input: RequestInfo | URL, init: RequestInit = {}) {
 function firstPageFor(user: SessionUser): Page {
   const allowed = user.accountRole === 'admin' ? nav : nav.filter((item) => user.permissions?.includes(pagePermissions[item.id]));
   if (user.role === 'engineering' && allowed.some((item) => item.id === 'projects')) return 'projects';
+  if (user.role === 'qc' && allowed.some((item) => item.id === 'projects')) return 'projects';
   if (allowed.some((item) => item.id === 'scan')) return 'scan';
   return allowed[0]?.id || 'projects';
 }
@@ -65,6 +66,7 @@ export default function AppV3() {
   const [session, setSession] = useState<SessionUser | null>(null);
   const [projects, setProjects] = useState<Project[]>([]);
   const [engineeringProjectId, setEngineeringProjectId] = useState<string | null>(null);
+  const [scanProjectId, setScanProjectId] = useState<string | null>(null);
   const [toast, setToast] = useState<string | null>(null);
   const [time, setTime] = useState(() => new Date());
   const role = roles.find((item) => item.id === session?.role) || roles[0];
@@ -99,7 +101,8 @@ export default function AppV3() {
     if (session?.accountRole !== 'admin') return;
     window.sessionStorage.setItem(adminRoleKey, nextRole);
     setSession({ ...session, role: nextRole });
-    setPage(nextRole === 'engineering' ? 'projects' : 'scan');
+    setScanProjectId(null);
+    setPage(nextRole === 'engineering' || nextRole === 'qc' ? 'projects' : 'scan');
   };
 
   if (!session) return <div className="forge-loading" dir="rtl"><span className="forge-mark"><i /><i /><i /></span><b>در حال آماده‌سازی فضای کاری</b></div>;
@@ -121,10 +124,10 @@ export default function AppV3() {
       </header>
 
       <main className="forge-main">
-        {page === 'scan' && <ScanPage role={role} session={session} />}
+        {page === 'scan' && <ScanPage role={role} session={session} projects={projects} selectedProjectId={scanProjectId} onSelectProject={(projectId) => setScanProjectId(projectId)} onProjects={() => navigate('projects')} />}
         {page === 'flow' && <FlowPage projects={projects} onProjects={() => navigate('projects')} canCreateProject={session.accountRole === 'admin' || session.permissions.includes('project_create')} />}
         {page === 'engineering' && <EngineeringPage projects={projects} requestedProjectId={engineeringProjectId} onProjects={setProjects} notify={notify} onCreateProject={() => navigate('projects')} />}
-        {page === 'projects' && <ProjectsPage projects={projects} onProjects={setProjects} notify={notify} canManage={session.accountRole === 'admin' || session.permissions.includes('project_create')} canEngineer={session.accountRole === 'admin' || session.permissions.includes('engineering')} onDesignRoute={(project) => { setEngineeringProjectId(project.id); navigate('engineering'); }} />}
+        {page === 'projects' && <ProjectsPage projects={projects} onProjects={setProjects} notify={notify} canManage={session.accountRole === 'admin' || session.permissions.includes('project_create')} canEngineer={session.accountRole === 'admin' || session.permissions.includes('engineering')} isQc={session.role === 'qc'} onOpenScanner={(project) => { setScanProjectId(project.id); navigate('scan'); }} onDesignRoute={(project) => { setEngineeringProjectId(project.id); navigate('engineering'); }} />}
         {page === 'access' && session.accountRole === 'admin' && <AccessMatrixPage notify={notify} projects={projects} />}
       </main>
       <nav className="forge-dock">{visibleNav.map((item) => { const Icon = item.icon; return <button type="button" key={item.id} className={page === item.id ? 'active' : ''} onClick={() => navigate(item.id)}><Icon size={19} /><span>{item.title}</span></button>; })}</nav>
@@ -137,13 +140,14 @@ function PageHeader({ eyebrow, title, children }: { eyebrow: string; title: stri
   return <header className="page-heading"><div><span>{eyebrow}</span><h1>{title}</h1></div>{children}</header>;
 }
 
-function ScanPage({ role, session }: { role: (typeof roles)[number]; session: SessionUser }) {
+function ScanPage({ role, session, projects, selectedProjectId, onSelectProject, onProjects }: { role: (typeof roles)[number]; session: SessionUser; projects: Project[]; selectedProjectId: string | null; onSelectProject: (projectId: string | null) => void; onProjects: () => void }) {
   const [cameraOpen, setCameraOpen] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [reworkOpen, setReworkOpen] = useState(false);
   const [usbCode, setUsbCode] = useState('');
   const [result, setResult] = useState<{ code: string; found: boolean; message: string; scan?: ScanResolution; inputSource: 'camera' | 'usb' | 'manual'; manualReason?: string; confirmed?: boolean } | null>(null);
   const [busy, setBusy] = useState(false);
+  const selectedProject = projects.find((project) => project.id === selectedProjectId) || null;
 
   const operatorStation = role.id === 'operator' ? (session.accountRole === 'admin' ? 'تمام مجموعه‌ها' : session.scope || 'تخصیص‌نیافته') : null;
   const scannerMeaning = operatorStation ? `ثبت اتمام «${operatorStation}»` : role.action;
@@ -152,7 +156,8 @@ function ScanPage({ role, session }: { role: (typeof roles)[number]; session: Se
     if (code.length < 2) return;
     setBusy(true); setCameraOpen(false); setManualOpen(false);
     try {
-      const response = await apiFetch(`/api/scan/${encodeURIComponent(code)}`);
+      const projectQuery = role.id === 'qc' && selectedProject ? `?projectId=${encodeURIComponent(selectedProject.id)}` : '';
+      const response = await apiFetch(`/api/scan/${encodeURIComponent(code)}${projectQuery}`);
       const data = await response.json();
       const scan = data.scan as ScanResolution | undefined;
       const blockedMessage = scan?.rejectionReason === 'OPERATOR_ASSIGNMENT_REQUIRED'
@@ -169,7 +174,7 @@ function ScanPage({ role, session }: { role: (typeof roles)[number]; session: Se
     if (!result?.scan?.allowed) return;
     setBusy(true); setReworkOpen(false);
     try {
-      const response = await apiFetch('/api/scan/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: result.code, inputSource: result.inputSource, manualReason: result.manualReason, clientRequestId: crypto.randomUUID(), decision, reworkMode: rework?.mode, comment: rework?.comment }) });
+      const response = await apiFetch('/api/scan/confirm', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ code: result.code, projectId: role.id === 'qc' ? selectedProject?.id : undefined, inputSource: result.inputSource, manualReason: result.manualReason, clientRequestId: crypto.randomUUID(), decision, reworkMode: rework?.mode, comment: rework?.comment }) });
       const data = await response.json();
       if (!response.ok) { setResult({ ...result, message: data.error || 'عملیات ثبت نشد.' }); return; }
       setResult({ ...result, confirmed: true, scan: data.next || result.scan, message: data.duplicate ? 'این درخواست قبلاً ثبت شده است.' : `${data.action} با موفقیت ثبت شد.` });
@@ -179,18 +184,29 @@ function ScanPage({ role, session }: { role: (typeof roles)[number]; session: Se
 
   const usbSubmit = (event: FormEvent) => { event.preventDefault(); void process(usbCode, 'usb'); setUsbCode(''); };
 
+  if (role.id === 'qc' && !selectedProject) {
+    const readyProjects = projects.filter((project) => project.sets?.length);
+    return <>
+      <PageHeader eyebrow="کنترل کیفیت" title="انتخاب پروژه جاری" />
+      <section className="qc-project-workspace">
+        <header><span><ShieldCheck size={22} /></span><div><h2>بارکدخوان کنترل کیفیت</h2><p>پروژه را انتخاب کنید؛ بارکدخوان فقط کدهای همان پروژه را بررسی می‌کند.</p></div></header>
+        {readyProjects.length ? <div className="qc-project-grid">{readyProjects.map((project) => <article key={project.id}><div className="qc-project-card-head"><span><Factory size={20} /></span><small>{project.code}</small></div><h3>{project.name}</h3><p>{project.sets.length.toLocaleString('fa-IR')} مجموعه در مسیر تولید</p><div className="qc-route-mini">{project.sets.slice(0, 4).map((set) => <span key={set.id}>{set.name}</span>)}</div><button type="button" onClick={() => onSelectProject(project.id)}><ScanLine size={17} /> باز کردن بارکدخوان QC <ArrowLeft size={16} /></button></article>)}</div> : <EmptyCanvas title="پروژه آماده‌ای وجود ندارد" text="پس از تعریف مسیر مهندسی، پروژه برای کنترل کیفیت در این بخش نمایش داده می‌شود." icon={<FolderKanban size={30} />} />}
+      </section>
+    </>;
+  }
+
   return <>
-    <PageHeader eyebrow="ایستگاه اسکن" title="اسکن مجموعه"><div className={`active-operation ${operatorStation ? 'station-bound' : ''}`}><span>{operatorStation ? 'بارکدخوان اختصاصی مجموعه' : 'عملیات این کاربر'}</span><b>{scannerMeaning}</b>{operatorStation && <small>فقط QR مرحله مرتبط با «{operatorStation}» قابل ثبت است</small>}</div></PageHeader>
+    <PageHeader eyebrow="ایستگاه اسکن" title="اسکن مجموعه"><div className={`active-operation ${operatorStation ? 'station-bound' : ''}`}><span>{selectedProject ? 'پروژه فعال بارکدخوان' : operatorStation ? 'بارکدخوان اختصاصی مجموعه' : 'عملیات این کاربر'}</span><b>{selectedProject ? selectedProject.name : scannerMeaning}</b>{selectedProject ? <button type="button" className="change-scan-project" onClick={() => { setResult(null); onSelectProject(null); onProjects(); }}>تغییر پروژه</button> : operatorStation && <small>فقط QR مرحله مرتبط با «{operatorStation}» قابل ثبت است</small>}</div></PageHeader>
     <section className="scan-console">
       <div className="scan-console-head"><div className="secure-indicator"><ShieldCheck size={17} /><span>جلسه فعال</span></div><div className={`operator-chip ${operatorStation ? 'station-chip' : ''}`}><Barcode size={16} /><span>{operatorStation ? `بارکدخوان ${operatorStation}` : role.title}</span></div></div>
       {!result && <div className="scan-core">
         <div className="scanner-art"><div className="scanner-grid" /><div className="scanner-ring one" /><div className="scanner-ring two" /><div className="scanner-glyph"><QrCode size={62} strokeWidth={1.35} /></div><span className="scanner-beam" /></div>
-        <div className="scan-copy"><span>{operatorStation ? `ایستگاه اختصاصی ${operatorStation}` : 'آماده اسکن'}</span><h2>کد QR را داخل قاب قرار دهید</h2></div>
+        <div className="scan-copy"><span>{selectedProject ? `کنترل کیفیت · ${selectedProject.code}` : operatorStation ? `ایستگاه اختصاصی ${operatorStation}` : 'آماده اسکن'}</span><h2>کد QR را داخل قاب قرار دهید</h2></div>
         <button className={`camera-primary ${role.id === 'qc' ? 'qc-primary' : ''}`} type="button" onClick={() => setCameraOpen(true)} disabled={busy || (role.id === 'operator' && !session.scope && session.accountRole !== 'admin')}><Camera size={20} /><span>{role.id === 'qc' ? 'اسکن برای کنترل کیفیت' : operatorStation ? `اسکن در ایستگاه ${operatorStation}` : 'باز کردن بارکدخوان'}</span><ArrowLeft size={18} /></button>
         <div className="scan-alternatives"><form onSubmit={usbSubmit}><Barcode size={18} /><input value={usbCode} onChange={(event) => setUsbCode(event.target.value)} placeholder="بارکدخوان رومیزی" /><kbd>Enter</kbd></form><button type="button" onClick={() => setManualOpen(true)}><PenLine size={17} /><span>ورود دستی</span></button></div>
       </div>}
       {result && <div className={`scan-result ${result.found && result.scan?.allowed ? 'found' : 'missing'}`}><span className="result-icon">{result.confirmed || (result.found && result.scan?.allowed) ? <CircleCheck size={32} /> : <CircleAlert size={32} />}</span><small>کد خوانده‌شده</small><h2>{result.code}</h2>{result.scan && <div className="scan-resolved-card"><span><small>پروژه</small><b>{result.scan.project.name}</b></span><span><small>مجموعه</small><b>{result.scan.set.name}</b></span><span><small>مرحله جاری</small><b>{result.scan.step?.name || 'پایان مسیر'}</b></span><span><small>شماره سریال</small><b>{result.scan.serialNumber}</b></span></div>}<p>{result.message}</p><div className="scan-result-actions">{result.scan?.allowed && !result.confirmed && <><button className="confirm-scan" type="button" onClick={() => void confirm()} disabled={busy}><CircleCheck size={17} /> {busy ? 'در حال ثبت' : result.scan.action?.title}</button>{role.id === 'qc' && result.scan.action?.code === 'QC_APPROVE' && <button className="reject-scan" type="button" onClick={() => setReworkOpen(true)} disabled={busy}><CircleAlert size={17} /> رد و تعیین بازکاری</button>}</>}<button type="button" onClick={() => setResult(null)}><ScanLine size={17} /> اسکن کد دیگر</button></div></div>}
-      <div className="scan-console-foot"><span><i /> وضعیت: آماده</span><span>مفهوم اسکن: {scannerMeaning}</span></div>
+      <div className="scan-console-foot"><span><i /> وضعیت: آماده</span><span>{selectedProject ? `پروژه فعال: ${selectedProject.name}` : `مفهوم اسکن: ${scannerMeaning}`}</span></div>
       {cameraOpen && <CameraReader role={role} onClose={() => setCameraOpen(false)} onRead={(code) => void process(code, 'camera')} />}
     </section>
     {manualOpen && <ManualEntry onClose={() => setManualOpen(false)} onDone={(code, reason) => void process(code, 'manual', reason)} />}
@@ -286,7 +302,7 @@ function AccessMatrixPage({ notify, projects }: { notify: (message: string) => v
     let permissions = [...user.permissions];
     const operational: PermissionId[] = ['qc', 'production_control', 'packaging'];
     permissions = permissions.filter((permission) => !operational.includes(permission));
-    if (role === 'qc') permissions.push('scanner', 'qc');
+    if (role === 'qc') permissions.push('projects', 'scanner', 'qc');
     if (role === 'production') permissions.push('scanner', 'production_control');
     if (role === 'packaging') permissions.push('scanner', 'packaging');
     if (role === 'operator') permissions.push('scanner');
@@ -299,7 +315,7 @@ function AccessMatrixPage({ notify, projects }: { notify: (message: string) => v
     let role = user.role;
     if (!enabled && permission === 'project_create') permissions = [...permissions, 'projects'];
     if (!enabled && permission === 'engineering') { role = 'engineering'; permissions = [...permissions, 'projects']; }
-    if (!enabled && permission === 'qc') { role = 'qc'; permissions = [...permissions, 'scanner']; }
+    if (!enabled && permission === 'qc') { role = 'qc'; permissions = [...permissions, 'projects', 'scanner']; }
     if (!enabled && permission === 'production_control') { role = 'production'; permissions = [...permissions, 'scanner']; }
     if (!enabled && permission === 'packaging') { role = 'packaging'; permissions = [...permissions, 'scanner']; }
     if (permission === 'projects' && enabled) permissions = permissions.filter((item) => !['project_create', 'engineering'].includes(item));
@@ -458,14 +474,14 @@ function NewSetModal({ onClose, onCreate }: { onClose: () => void; onCreate: (va
   return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal set-quick-modal"><header><div><span>مسیر تولید پروژه</span><h2>افزودن مجموعه به مسیر</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><div className="set-modal-number"><span>۱</span><div><b>نام مجموعه را وارد کنید</b><small>مرحله اولیه و کنترل‌های QC و کنترل تولید به‌صورت خودکار ساخته می‌شوند.</small></div></div><div className="modal-grid"><label>نام مجموعه<input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="مثلاً: مونتاژ، جوش یا پکیجینگ" /></label><label>کد مجموعه <em>اختیاری</em><input value={code} onChange={(event) => setCode(event.target.value.toUpperCase())} placeholder="در صورت وجود" /></label></div><div className="modal-assurance"><ShieldCheck size={18} /><span><b>اپراتور همین مجموعه تعیین می‌شود</b><small>بارکدخوان اپراتور مفهوم «اتمام {name || 'این مجموعه'}» خواهد داشت.</small></span></div><footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" disabled={name.trim().length < 2} onClick={() => onCreate({ name: name.trim(), code: code.trim() })}><Plus size={15} /> افزودن به انتهای مسیر</button></footer></section></div>;
 }
 
-function ProjectsPage({ projects, onProjects, notify, onDesignRoute, canManage, canEngineer }: { projects: Project[]; onProjects: (projects: Project[]) => void; notify: (message: string) => void; onDesignRoute: (project: Project) => void; canManage: boolean; canEngineer: boolean }) {
+function ProjectsPage({ projects, onProjects, notify, onDesignRoute, onOpenScanner, canManage, canEngineer, isQc }: { projects: Project[]; onProjects: (projects: Project[]) => void; notify: (message: string) => void; onDesignRoute: (project: Project) => void; onOpenScanner: (project: Project) => void; canManage: boolean; canEngineer: boolean; isQc: boolean }) {
   const [open, setOpen] = useState(false);
   const [issueProject, setIssueProject] = useState<Project | null>(null);
   const [deleteProject, setDeleteProject] = useState<Project | null>(null);
   const create = async (input: Omit<Project, 'id' | 'sets'>) => { const response = await apiFetch('/api/projects', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'پروژه ذخیره نشد.'); return; } onProjects([...projects, data.project]); setOpen(false); notify('پروژه ایجاد شد؛ اکنون مسیر آن را در مهندسی تعریف کنید.'); };
   const issue = async (input: { projectId: string; serialNumber: string; barcode: string }) => { const response = await apiFetch('/api/work-items', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input) }); const data = await response.json(); if (!response.ok) { notify(data.error || 'شناسه تولید صادر نشد.'); return; } setIssueProject(null); notify(`بارکد ${data.item.barcode} برای کل مجموعه صادر شد.`); };
   const remove = async (project: Project) => { const response = await apiFetch(`/api/projects/${encodeURIComponent(project.id)}`, { method: 'DELETE' }); const data = await response.json(); if (!response.ok) { notify(data.error || 'پروژه حذف نشد.'); return; } onProjects(projects.filter((item) => item.id !== project.id)); setDeleteProject(null); notify(`پروژه «${project.name}» حذف شد.`); };
-  return <><PageHeader eyebrow="دفتر پروژه‌ها" title="پروژه‌ها">{canManage && <button className="heading-action" type="button" onClick={() => setOpen(true)}><Plus size={18} /> پروژه جدید</button>}</PageHeader>{projects.length ? <section className="entity-grid">{projects.map((project) => <article className="entity-card project-card" key={project.id}><div className="project-card-top"><span className="entity-icon"><Factory size={22} /></span><span className={`route-state ${project.sets?.length ? 'ready' : ''}`}>{project.sets?.length ? 'مسیر تعریف شده' : 'در انتظار تعریف مسیر'}</span></div><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p><div className="project-route-preview">{project.sets?.length ? project.sets.slice(0, 4).map((set, index) => <span key={set.id}><b>{(index + 1).toLocaleString('fa-IR')}</b>{set.name}</span>) : <span className="empty-preview">مسیر تولید هنوز چیده نشده است</span>}</div><div className="entity-card-actions project-actions">{canEngineer && <button className="design-route" type="button" onClick={() => onDesignRoute(project)}><Route size={15} /> {project.sets?.length ? 'ویرایش مجموعه‌ها' : 'تعریف مجموعه‌ها'}</button>}{canEngineer && <button type="button" disabled={!project.sets?.length} onClick={() => setIssueProject(project)}><Barcode size={15} /> صدور QR</button>}{canManage && <button className="danger-action" type="button" onClick={() => setDeleteProject(project)}><Trash2 size={15} /> حذف</button>}</div></article>)}</section> : <EmptyCanvas title="پروژه‌ای ثبت نشده" text="نام پروژه، کد، نقشه‌ها و نوع ساخت را ثبت کنید." icon={<FolderKanban size={32} />} action={canManage ? <button className="empty-action" type="button" onClick={() => setOpen(true)}><Plus size={17} /> تعریف اولین پروژه</button> : undefined} />}{open && <NewProjectModal onClose={() => setOpen(false)} onCreate={(input) => void create(input)} />}{issueProject && <IssueWorkItemModal project={issueProject} onClose={() => setIssueProject(null)} onIssue={(input) => void issue(input)} />}{deleteProject && <DeleteProjectModal project={deleteProject} onClose={() => setDeleteProject(null)} onDelete={() => void remove(deleteProject)} />}</>;
+  return <><PageHeader eyebrow={isQc ? 'کنترل کیفیت' : 'دفتر پروژه‌ها'} title={isQc ? 'پروژه‌های جاری' : 'پروژه‌ها'}>{canManage && <button className="heading-action" type="button" onClick={() => setOpen(true)}><Plus size={18} /> پروژه جدید</button>}</PageHeader>{projects.length ? <section className="entity-grid">{projects.map((project) => <article className={`entity-card project-card ${isQc ? 'qc-project-card' : ''}`} key={project.id}><div className="project-card-top"><span className="entity-icon"><Factory size={22} /></span><span className={`route-state ${project.sets?.length ? 'ready' : ''}`}>{project.sets?.length ? 'مسیر تعریف شده' : 'در انتظار تعریف مسیر'}</span></div><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p><div className="project-route-preview">{project.sets?.length ? project.sets.slice(0, 4).map((set, index) => <span key={set.id}><b>{(index + 1).toLocaleString('fa-IR')}</b>{set.name}</span>) : <span className="empty-preview">مسیر تولید هنوز چیده نشده است</span>}</div><div className="entity-card-actions project-actions">{isQc && <button className="open-qc-scanner" type="button" disabled={!project.sets?.length} onClick={() => onOpenScanner(project)}><ScanLine size={16} /> باز کردن بارکدخوان QC</button>}{canEngineer && <button className="design-route" type="button" onClick={() => onDesignRoute(project)}><Route size={15} /> {project.sets?.length ? 'ویرایش مجموعه‌ها' : 'تعریف مجموعه‌ها'}</button>}{canEngineer && <button type="button" disabled={!project.sets?.length} onClick={() => setIssueProject(project)}><Barcode size={15} /> صدور QR</button>}{canManage && <button className="danger-action" type="button" onClick={() => setDeleteProject(project)}><Trash2 size={15} /> حذف</button>}</div></article>)}</section> : <EmptyCanvas title="پروژه‌ای ثبت نشده" text="نام پروژه، کد، نقشه‌ها و نوع ساخت را ثبت کنید." icon={<FolderKanban size={32} />} action={canManage ? <button className="empty-action" type="button" onClick={() => setOpen(true)}><Plus size={17} /> تعریف اولین پروژه</button> : undefined} />}{open && <NewProjectModal onClose={() => setOpen(false)} onCreate={(input) => void create(input)} />}{issueProject && <IssueWorkItemModal project={issueProject} onClose={() => setIssueProject(null)} onIssue={(input) => void issue(input)} />}{deleteProject && <DeleteProjectModal project={deleteProject} onClose={() => setDeleteProject(null)} onDelete={() => void remove(deleteProject)} />}</>;
 }
 
 function DeleteProjectModal({ project, onClose, onDelete }: { project: Project; onClose: () => void; onDelete: () => void }) {

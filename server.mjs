@@ -72,15 +72,18 @@ function passwordMatches(user, password) {
 
 const permissionCatalog = new Set(['projects', 'project_create', 'engineering', 'production_flow', 'scanner', 'qc', 'production_control', 'packaging', 'access_matrix']);
 const rolePermissionDefaults = {
-  operator: ['scanner'], qc: ['scanner', 'qc'], production: ['scanner', 'production_control'],
+  operator: ['scanner'], qc: ['projects', 'scanner', 'qc'], production: ['scanner', 'production_control'],
   packaging: ['scanner', 'packaging'], engineering: ['projects', 'engineering'],
   admin: [...permissionCatalog],
 };
 
 function permissionsFor(user) {
   if (user.role === 'admin') return [...permissionCatalog];
-  if (!Array.isArray(user.permissions)) return rolePermissionDefaults[user.role] || [];
-  return [...new Set(user.permissions.map((value) => String(value)).filter((value) => permissionCatalog.has(value)))];
+  const permissions = Array.isArray(user.permissions)
+    ? user.permissions.map((value) => String(value)).filter((value) => permissionCatalog.has(value))
+    : rolePermissionDefaults[user.role] || [];
+  if (user.role === 'qc') permissions.push('projects', 'scanner', 'qc');
+  return [...new Set(permissions)];
 }
 
 function hasPermission(actor, permission) {
@@ -419,6 +422,9 @@ async function handleApi(req, res, pathname) {
       sendJson(res, 422, { error: 'اطلاعات ثبت اسکن کامل نیست.' }); return true;
     }
     const decision = input.decision === 'reject' ? 'reject' : 'approve';
+    if (req.authUser.role === 'qc' && (typeof input.projectId !== 'string' || input.projectId.trim().length < 2)) {
+      sendJson(res, 422, { error: 'پروژه فعال بارکدخوان کنترل کیفیت مشخص نشده است.' }); return true;
+    }
     if (decision === 'reject' && (req.authUser.role !== 'qc' || !['same_step', 'independent'].includes(input.reworkMode) || typeof input.comment !== 'string' || input.comment.trim().length < 3)) {
       sendJson(res, 422, { error: 'برای رد کنترل کیفیت، نوع بازکاری و شرح علت الزامی است.' }); return true;
     }
@@ -427,6 +433,7 @@ async function handleApi(req, res, pathname) {
       inputSource: sources[input.inputSource], manualReason: input.inputSource === 'manual' ? String(input.manualReason).trim() : null,
       decision, reworkMode: decision === 'reject' ? input.reworkMode : null,
       comment: decision === 'reject' ? input.comment.trim() : null,
+      projectId: req.authUser.role === 'qc' ? input.projectId.trim() : null,
     }, req.authUser);
     sendJson(res, 200, result);
     return true;
@@ -437,6 +444,10 @@ async function handleApi(req, res, pathname) {
     if (databaseConfigured()) {
       const scan = await resolveBarcode(code, req.authUser);
       if (!scan) { sendJson(res, 404, { error: 'برای این کد رکورد فعالی ثبت نشده است.' }); return true; }
+      const requestedProjectId = new URL(req.url || '/', 'http://local').searchParams.get('projectId');
+      if (req.authUser.role === 'qc' && (!requestedProjectId || scan.project.id !== requestedProjectId)) {
+        sendJson(res, 409, { error: requestedProjectId ? 'این بارکد متعلق به پروژه انتخاب‌شده نیست.' : 'ابتدا پروژه فعال بارکدخوان را انتخاب کنید.' }); return true;
+      }
       sendJson(res, 200, { scan });
       return true;
     }
@@ -463,6 +474,7 @@ async function handle(req, res, isTls) {
       OPERATOR_NOT_ASSIGNED: 'این مجموعه در حوزه مسئولیت اپراتور نیست.', STEP_NOT_READY: 'این مرحله آماده تأیید اپراتور نیست.',
       QC_NOT_READY: 'قطعه هنوز در انتظار کنترل کیفیت نیست.', PRODUCTION_CONTROL_NOT_READY: 'قطعه هنوز در انتظار کنترل تولید نیست.',
       PACKAGING_NOT_READY: 'قطعه هنوز وارد مرحله پکیجینگ نشده است.', ROLE_CANNOT_SCAN: 'نقش فعلی مجوز ثبت عملیات اسکن را ندارد.',
+      PROJECT_SCOPE_MISMATCH: 'این بارکد متعلق به پروژه انتخاب‌شده نیست.',
       SET_ROUTE_NOT_FOUND: 'مسیر مجموعه پیدا نشد.', SET_ROUTE_EMPTY: 'برای این مجموعه زیرفرآیندی تعریف نشده است.',
     };
     const message = error?.message === 'ROUTE_ALREADY_IN_USE' ? 'این مسیر وارد تولید شده و باید با نسخه جدید اصلاح شود.' :

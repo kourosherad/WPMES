@@ -435,6 +435,9 @@ export async function confirmBarcode(input, actor) {
     const contextResult = await barcodeContext(new sql.Request(transaction), input.code, true);
     const row = contextResult.recordset[0];
     if (!row) { const error = new Error('BARCODE_NOT_FOUND'); error.statusCode = 404; throw error; }
+    if (actor.role === 'qc' && (!input.projectId || String(row.ProjectId) !== String(input.projectId))) {
+      const error = new Error('PROJECT_SCOPE_MISMATCH'); error.statusCode = 409; throw error;
+    }
     let action = actionFor(row, actor);
     if (actor.role === 'qc' && input.decision === 'reject') {
       action = row.ExecutionStatus === 'WAITING_QC'
