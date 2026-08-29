@@ -74,3 +74,16 @@ body{background:var(--signature-canvas)}
   mask-image:none;
 }
 @media(max-width:780px){.forge-app:before{inset:78px 0 0}.forge-ambient{opacity:.5}}
+
+/* Station-bound operator identity */
+.active-operation.station-bound{min-width:315px;border-color:rgba(198,111,64,.28);background:linear-gradient(125deg,#fff,#fff5ee);box-shadow:0 14px 32px rgba(134,73,42,.1)}
+.active-operation.station-bound span{color:#a05d3b}.active-operation.station-bound b{color:#17343c}.active-operation.station-bound small{display:block;margin-top:3px;color:#77898c;font-size:8px}
+.operator-chip.station-chip{color:#9a5937;border-color:rgba(198,111,64,.24);background:#fff7f1}.operator-chip.station-chip svg{color:#c66f40}
+.operator-scope{position:relative;min-height:82px;padding:13px 15px!important;border:1px solid rgba(25,123,134,.18);border-radius:14px;background:linear-gradient(120deg,#edf5f3,#fff);display:grid!important;grid-template-columns:minmax(220px,1fr) minmax(240px,.9fr) auto;gap:14px;align-items:center;color:#23464e!important}
+.operator-scope>span b,.operator-scope>span small{display:block}.operator-scope>span b{font-size:10px}.operator-scope>span small{margin-top:4px;color:#6c8084;font-size:8px;line-height:1.8}
+.operator-scope select{width:100%;height:43px;margin:0;padding:0 11px;border:1px solid rgba(19,84,95,.18);border-radius:10px;color:#173940;background:#fff;outline:0}
+.operator-scope em{min-width:108px;height:34px;padding:0 10px;border:1px solid #b9d9c9;border-radius:9px;color:#2d7656;background:#e9f6ef;display:flex;align-items:center;justify-content:center;gap:5px;font-size:8px;font-style:normal;white-space:nowrap}
+.operator-scope.unassigned{border-color:#e8c5b3;background:linear-gradient(120deg,#fff3ec,#fff)}.operator-scope.unassigned em{color:#a85d3c;border-color:#ecc9b8;background:#fff0e8}
+.scan-meaning{border-color:rgba(198,111,64,.24);background:linear-gradient(120deg,#fff7f0,#eef5f3)}.scan-meaning>svg{color:#c66f40}.scan-meaning small{color:#8c725f}.scan-meaning b{color:#23454c}
+@media(max-width:900px){.operator-scope{grid-template-columns:1fr 1fr}.operator-scope em{grid-column:1/-1;justify-self:start}}
+@media(max-width:600px){.active-operation.station-bound{min-width:0}.operator-scope{grid-template-columns:1fr}.operator-scope em{grid-column:auto}}
