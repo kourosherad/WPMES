@@ -80,7 +80,20 @@ async function ensureIdentity(request, user) {
 }
 
 function assembleProjects(result) {
-  const [projectRows, drawingRows, setRows, stepRows] = result.recordsets;
+  const [projectRows, drawingRows, setRows, stepRows, profileRows] = result.recordsets;
+  const profiles = new Map(profileRows.map((row) => {
+    let details = {};
+    try { details = JSON.parse(row.ProfileJson || '{}'); } catch { details = {}; }
+    return [String(row.ProjectId).toLowerCase(), {
+      mainDrawingNumber: row.MainDrawingNumber || '',
+      componentDrawings: Array.isArray(details.componentDrawings) ? details.componentDrawings : [],
+      customFields: details.customFields && typeof details.customFields === 'object' ? details.customFields : {},
+      importedHeaders: Array.isArray(details.importedHeaders) ? details.importedHeaders : [],
+      importedRows: Array.isArray(details.importedRows) ? details.importedRows : [],
+      sourceFileName: row.SourceFileName || '', importedRowCount: Number(row.ImportedRowCount || 0),
+      updatedAt: row.UpdatedAtUtc,
+    }];
+  }));
   const drawings = new Map();
   for (const row of drawingRows) {
     const key = String(row.ProjectId).toLowerCase();
@@ -116,6 +129,7 @@ function assembleProjects(result) {
       id: String(row.Id), name: row.ProjectName, code: row.ProjectCode,
       itemType: row.ItemType === 'SINGLE' ? 'single' : 'assembly',
       drawings: drawings.get(key) || [], sets: sets.get(key) || [],
+      profile: profiles.get(key) || null,
       createdAt: row.CreatedAtUtc, updatedAt: row.UpdatedAtUtc,
     };
   });
@@ -139,6 +153,8 @@ export async function listProjects(projectId = null) {
       WHERE Routes.VersionNumber = (SELECT MAX(CurrentRoute.VersionNumber) FROM engineering.RouteDefinitions CurrentRoute WHERE CurrentRoute.ItemDefinitionId = Items.Id)
         AND (@projectId IS NULL OR Items.ProjectId = @projectId)
       ORDER BY Items.ProjectId, Items.SetOrder, Steps.StepOrder;
+    SELECT ProjectId, MainDrawingNumber, ProfileJson, SourceFileName, ImportedRowCount, UpdatedAtUtc
+      FROM core.ProjectProfiles WHERE @projectId IS NULL OR ProjectId = @projectId;
   `);
   return assembleProjects(result);
 }
@@ -181,6 +197,58 @@ export async function createProject(input, actor) {
   }
 }
 
+export async function saveProjectProfile(projectId, profile, actor) {
+  const pool = await databasePool();
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const identity = await ensureIdentity(new sql.Request(transaction), actor);
+    const project = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
+      .query(`SELECT ItemType FROM core.Projects WITH (UPDLOCK, HOLDLOCK) WHERE Id=@projectId;`);
+    if (!project.recordset.length) { const error = new Error('PROJECT_NOT_FOUND'); error.statusCode = 404; throw error; }
+    if (project.recordset[0].ItemType !== 'ASSEMBLY') { const error = new Error('PROFILE_ASSEMBLY_ONLY'); error.statusCode = 409; throw error; }
+    const details = {
+      componentDrawings: profile.componentDrawings,
+      customFields: profile.customFields || {},
+      importedHeaders: profile.importedHeaders || [],
+      importedRows: profile.importedRows || [],
+    };
+    await new sql.Request(transaction)
+      .input('projectId', sql.UniqueIdentifier, projectId)
+      .input('mainDrawing', sql.NVarChar(100), profile.mainDrawingNumber || null)
+      .input('json', sql.NVarChar(sql.MAX), JSON.stringify(details))
+      .input('fileName', sql.NVarChar(260), profile.sourceFileName || null)
+      .input('rowCount', sql.Int, profile.importedRows?.length || 0)
+      .input('userId', sql.UniqueIdentifier, identity.UserId)
+      .query(`MERGE core.ProjectProfiles AS Target
+        USING (SELECT @projectId AS ProjectId) AS Source ON Target.ProjectId=Source.ProjectId
+        WHEN MATCHED THEN UPDATE SET MainDrawingNumber=@mainDrawing, ProfileJson=@json, SourceFileName=@fileName,
+          ImportedRowCount=@rowCount, UpdatedByUserId=@userId, UpdatedAtUtc=SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN INSERT (ProjectId,MainDrawingNumber,ProfileJson,SourceFileName,ImportedRowCount,UpdatedByUserId)
+          VALUES (@projectId,@mainDrawing,@json,@fileName,@rowCount,@userId);`);
+    await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
+      .query('DELETE FROM core.Drawings WHERE ProjectId=@projectId;');
+    const drawings = [...new Set([profile.mainDrawingNumber, ...profile.componentDrawings.map((item) => item.drawingNumber)].map((value) => String(value || '').trim()).filter(Boolean))];
+    for (const drawing of drawings) {
+      await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).input('drawing', sql.NVarChar(100), drawing)
+        .query(`INSERT INTO core.Drawings (ProjectId,DrawingNumber,RevisionCode) VALUES (@projectId,@drawing,N'REV-0');`);
+    }
+    await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
+      .query('UPDATE core.Projects SET UpdatedAtUtc=SYSUTCDATETIME() WHERE Id=@projectId;');
+    await new sql.Request(transaction)
+      .input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
+      .input('correlationId', sql.UniqueIdentifier, randomUUID()).input('entityId', sql.NVarChar(100), projectId)
+      .input('after', sql.NVarChar(sql.MAX), JSON.stringify(profile))
+      .query(`INSERT INTO ops.AuditLogs (ActorUserId,ActorRoleId,EventType,EntityType,EntityId,CorrelationId,AfterJson)
+        VALUES (@userId,@roleId,'PROJECT_PROFILE_UPDATED','PROJECT_PROFILE',@entityId,@correlationId,@after);`);
+    await transaction.commit();
+    return (await listProjects(projectId))[0];
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  }
+}
+
 export async function deleteProject(projectId, actor) {
   const pool = await databasePool();
   const transaction = new sql.Transaction(pool);
@@ -202,6 +270,7 @@ export async function deleteProject(projectId, actor) {
       DELETE Routes FROM engineering.RouteDefinitions Routes
         JOIN engineering.ItemDefinitions Items ON Items.Id=Routes.ItemDefinitionId WHERE Items.ProjectId=@projectId;
       DELETE FROM engineering.ItemDefinitions WHERE ProjectId=@projectId;
+      DELETE FROM core.ProjectProfiles WHERE ProjectId=@projectId;
       DELETE FROM core.Drawings WHERE ProjectId=@projectId;
       DELETE FROM core.Projects WHERE Id=@projectId;
     `);

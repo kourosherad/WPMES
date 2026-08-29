@@ -16,12 +16,15 @@
     "lucide-react": "latest",
     "msnodesqlv8": "^5.2.3",
     "mssql": "^12.7.0",
+    "qrcode": "^1.5.4",
     "react": "latest",
     "react-dom": "latest",
+    "read-excel-file": "^9.3.10",
     "typescript": "latest",
     "vite": "latest"
   },
   "devDependencies": {
+    "@types/qrcode": "^1.5.6",
     "@types/react": "latest",
     "@types/react-dom": "latest"
   }

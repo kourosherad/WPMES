@@ -5,7 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode } from './database.mjs';
+import { confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode, saveProjectProfile as saveDatabaseProjectProfile } from './database.mjs';
 
 const appRoot = fileURLToPath(new URL('.', import.meta.url));
 const root = join(appRoot, 'dist');
@@ -194,7 +194,7 @@ async function readRaw(req) {
   let raw = '';
   for await (const chunk of req) {
     raw += chunk;
-    if (raw.length > 65536) throw new Error('PAYLOAD_TOO_LARGE');
+    if (raw.length > 5 * 1024 * 1024) throw new Error('PAYLOAD_TOO_LARGE');
   }
   return raw;
 }
@@ -213,6 +213,31 @@ function validProjectSet(input) {
     typeof input.operatorRole === 'string' && input.operatorRole.trim().length >= 2 &&
     ['single', 'assembly'].includes(input.kind) && Array.isArray(input.steps) && input.steps.length <= 100 &&
     input.steps.every((step) => step && typeof step.name === 'string' && step.name.trim().length >= 2 && ['internal', 'external'].includes(step.execution));
+}
+
+function defaultAssemblySets() {
+  return [
+    ['MONTAGE', 'مونتاژ'], ['WELDING', 'جوش'], ['SANDBLAST', 'سندبلاست'],
+    ['INTERMEDIATE-PAINT', 'رنگ میانی'], ['FINAL-PAINT', 'رنگ نهایی'], ['PACKAGING', 'بسته‌بندی'],
+  ].map(([code, name]) => ({
+    id: randomUUID(), name, code, kind: 'assembly', operatorRole: name,
+    steps: [{ id: randomUUID(), name, execution: 'internal', qcRequired: true, productionControlRequired: true, barcodeAfter: false }],
+  }));
+}
+
+function normalizeProjectProfile(input) {
+  if (!input || !Array.isArray(input.componentDrawings) || input.componentDrawings.length > 5000 || !Array.isArray(input.importedHeaders) || input.importedHeaders.length > 80 || !Array.isArray(input.importedRows) || input.importedRows.length > 3000) return null;
+  const componentDrawings = input.componentDrawings.map((item) => ({
+    id: String(item?.id || randomUUID()), drawingNumber: String(item?.drawingNumber || '').trim().slice(0, 100),
+    description: String(item?.description || '').trim().slice(0, 250),
+  })).filter((item) => item.drawingNumber);
+  const importedHeaders = input.importedHeaders.map((value) => String(value || '').trim().slice(0, 120)).filter(Boolean);
+  const importedRows = input.importedRows.map((row) => Object.fromEntries(importedHeaders.map((header) => [header, String(row?.[header] ?? '').slice(0, 1000)])));
+  return {
+    mainDrawingNumber: String(input.mainDrawingNumber || '').trim().slice(0, 100), componentDrawings,
+    customFields: input.customFields && typeof input.customFields === 'object' && !Array.isArray(input.customFields) ? input.customFields : {},
+    importedHeaders, importedRows, sourceFileName: String(input.sourceFileName || '').trim().slice(0, 260),
+  };
 }
 
 async function handleApi(req, res, pathname) {
@@ -334,25 +359,47 @@ async function handleApi(req, res, pathname) {
     if (!input || typeof input.name !== 'string' || input.name.trim().length < 2 || typeof input.code !== 'string' || input.code.trim().length < 2 || !['single', 'assembly'].includes(input.itemType)) {
       sendJson(res, 422, { error: 'نام، کد و نوع پروژه الزامی است.' }); return true;
     }
+    const sets = input.itemType === 'assembly' ? defaultAssemblySets() : [];
     const normalized = {
       name: input.name.trim(), code: input.code.trim(), itemType: input.itemType,
-      drawings: Array.isArray(input.drawings) ? input.drawings.map((value) => String(value).trim()).filter(Boolean).slice(0, 100) : [],
+      drawings: input.itemType === 'single' && Array.isArray(input.drawings) ? input.drawings.map((value) => String(value).trim()).filter(Boolean).slice(0, 100) : [],
+      sets,
     };
     if (databaseConfigured()) {
-      const project = await createDatabaseProject(normalized, req.authUser);
+      const created = await createDatabaseProject(normalized, req.authUser);
+      const project = sets.length ? await replaceProjectRoute(created.id, sets, req.authUser) : created;
       sendJson(res, 201, { project });
       return true;
     }
     const state = await loadState();
     const project = {
       id: randomUUID(), ...normalized,
-      sets: [],
+      sets,
+      profile: input.itemType === 'assembly' ? { mainDrawingNumber: '', componentDrawings: [], customFields: {}, importedHeaders: [], importedRows: [], sourceFileName: '', importedRowCount: 0 } : null,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
     state.projects.push(project);
     await saveState(state);
     sendJson(res, 201, { project });
     return true;
+  }
+  if (pathname.startsWith('/api/projects/') && pathname.endsWith('/profile') && req.method === 'PUT') {
+    if (!hasPermission(req.authUser, 'engineering')) { sendJson(res, 403, { error: 'ویرایش پروفایل فقط در اختیار امور مهندسی است.' }); return true; }
+    const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/profile'.length));
+    const profile = normalizeProjectProfile(await readJson(req));
+    if (!profile) { sendJson(res, 422, { error: 'اطلاعات پروفایل پروژه معتبر نیست.' }); return true; }
+    if (databaseConfigured()) {
+      const project = await saveDatabaseProjectProfile(id, profile, req.authUser);
+      sendJson(res, 200, { project }); return true;
+    }
+    const state = await loadState();
+    const index = state.projects.findIndex((project) => project.id === id);
+    if (index < 0) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
+    if (state.projects[index].itemType !== 'assembly') { sendJson(res, 409, { error: 'پروفایل مونتاژی فقط برای Assembly Part فعال است.' }); return true; }
+    const drawings = [...new Set([profile.mainDrawingNumber, ...profile.componentDrawings.map((item) => item.drawingNumber)].filter(Boolean))];
+    state.projects[index] = { ...state.projects[index], profile: { ...profile, importedRowCount: profile.importedRows.length, updatedAt: new Date().toISOString() }, drawings, updatedAt: new Date().toISOString() };
+    await saveState(state);
+    sendJson(res, 200, { project: state.projects[index] }); return true;
   }
   if (pathname.startsWith('/api/projects/') && pathname.endsWith('/route') && req.method === 'PUT') {
     if (!hasPermission(req.authUser, 'engineering')) { sendJson(res, 403, { error: 'دسترسی مهندسی برای این کاربر فعال نیست.' }); return true; }
@@ -406,10 +453,11 @@ async function handleApi(req, res, pathname) {
     if (!hasPermission(req.authUser, 'engineering')) { sendJson(res, 403, { error: 'صدور بارکد فقط در اختیار امور مهندسی است.' }); return true; }
     if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
     const input = await readJson(req);
-    if (!input || typeof input.projectId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2 || typeof input.barcode !== 'string' || input.barcode.trim().length < 2) {
-      sendJson(res, 422, { error: 'پروژه، شماره سریال و بارکد الزامی است.' }); return true;
+    if (!input || typeof input.projectId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2) {
+      sendJson(res, 422, { error: 'پروژه و شماره سریال الزامی است.' }); return true;
     }
-    const item = await issueWorkItem({ projectId: input.projectId, serialNumber: input.serialNumber.trim(), barcode: input.barcode.trim().toUpperCase() }, req.authUser);
+    const barcode = `WPMES-${Date.now().toString(36)}-${randomBytes(5).toString('hex')}`.toUpperCase();
+    const item = await issueWorkItem({ projectId: input.projectId, serialNumber: input.serialNumber.trim(), barcode }, req.authUser);
     sendJson(res, 201, { item });
     return true;
   }
@@ -479,6 +527,7 @@ async function handle(req, res, isTls) {
     };
     const message = error?.message === 'ROUTE_ALREADY_IN_USE' ? 'این مسیر وارد تولید شده و باید با نسخه جدید اصلاح شود.' :
       error?.message === 'PROJECT_ALREADY_IN_PRODUCTION' ? 'این پروژه وارد چرخه تولید شده و برای حفظ سوابق قابل حذف نیست.' :
+      error?.message === 'PROFILE_ASSEMBLY_ONLY' ? 'پروفایل مونتاژی فقط برای Assembly Part فعال است.' :
       error?.message === 'PROJECT_NOT_FOUND' ? 'پروژه پیدا نشد.' : status === 409 ? 'کد واردشده قبلاً ثبت شده است.' : 'درخواست قابل پردازش نیست.';
     console.error('Request failed', { pathname, status, code: error?.code, number: error?.number, message: error?.message });
     sendJson(res, status, { error: scanErrors[error?.message] || message });

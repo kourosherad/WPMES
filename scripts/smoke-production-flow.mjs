@@ -20,7 +20,7 @@ try {
 
   const smoke = await new sql.ConnectionPool(trusted(smokeDatabase)).connect();
   try {
-    for (const file of ['001_initial_schema.sql', '002_project_route_columns.sql', '003_qc_rework_cases.sql']) {
+    for (const file of ['001_initial_schema.sql', '002_project_route_columns.sql', '003_qc_rework_cases.sql', '004_assembly_project_profiles.sql']) {
       const source = await readFile(join(appRoot, 'database', file), 'utf8');
       for (const batch of batches(source)) await smoke.request().batch(batch);
     }
