@@ -267,6 +267,20 @@ async function handleApi(req, res, pathname) {
     sendJson(res, 201, { user: { username, displayName, role, scope: '', permissions: user.permissions, isAdmin: false } });
     return true;
   }
+  if (pathname.startsWith('/api/admin/users/') && req.method === 'DELETE') {
+    if (req.authUser.accountRole !== 'admin' && req.authUser.role !== 'admin') { sendJson(res, 403, { error: 'این بخش فقط در اختیار مدیر کل سامانه است.' }); return true; }
+    const username = decodeURIComponent(pathname.slice('/api/admin/users/'.length)).trim().toLowerCase();
+    if (!username || username.includes('/')) { sendJson(res, 400, { error: 'نام کاربری معتبر نیست.' }); return true; }
+    const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
+    const users = authUsers(config);
+    const target = users.find((user) => user.username.toLowerCase() === username);
+    if (!target) { sendJson(res, 404, { error: 'کاربر پیدا نشد.' }); return true; }
+    if (target.role === 'admin' || target.username === req.authUser.username) { sendJson(res, 409, { error: 'حساب مدیر کل سامانه قابل حذف نیست.' }); return true; }
+    config.users = users.filter((user) => user.username.toLowerCase() !== username);
+    await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
+    sendJson(res, 200, { deleted: true, username });
+    return true;
+  }
   if (pathname === '/api/health' && req.method === 'GET') {
     const database = await databaseHealth();
     sendJson(res, database.configured && !database.connected ? 503 : 200, { status: database.connected || !database.configured ? 'ok' : 'degraded', service: 'factory-flow', phase: 1, tls: Boolean(req.socket.encrypted), database });

@@ -107,7 +107,7 @@ export default function AppV3() {
   return <div className="forge-app" dir="rtl">
     <div className="forge-ambient a" /><div className="forge-ambient b" />
     <aside className={`forge-rail ${railOpen ? 'open' : ''}`}>
-      <div className="forge-brand"><span className="forge-mark"><i /><i /><i /></span><div><b>خط‌نگار</b><small>سامانه کنترل تولید</small></div></div>
+      <div className="forge-brand"><span className="forge-mark"><i /><i /><i /></span><div><b>WPMES</b><small>سامانه اجرای تولید</small></div></div>
       <div className="rail-section-label">فضای کاری</div>
       <nav className="forge-nav" aria-label="ماژول‌های سامانه">{visibleNav.map((item) => { const Icon = item.icon; return <button type="button" key={item.id} className={page === item.id ? 'active' : ''} onClick={() => navigate(item.id)}><Icon size={19} /><span>{item.title}</span>{page === item.id && <ChevronLeft size={15} />}</button>; })}</nav>
       <div className="rail-foot"><div className="connection"><Radio size={15} /><span><b>{session.displayName}</b><small>{role.title}</small></span></div></div>
@@ -122,7 +122,7 @@ export default function AppV3() {
 
       <main className="forge-main">
         {page === 'scan' && <ScanPage role={role} />}
-        {page === 'flow' && <FlowPage projects={projects} onProjects={() => navigate('projects')} />}
+        {page === 'flow' && <FlowPage projects={projects} onProjects={() => navigate('projects')} canCreateProject={session.accountRole === 'admin' || session.permissions.includes('project_create')} />}
         {page === 'engineering' && <EngineeringPage projects={projects} requestedProjectId={engineeringProjectId} onProjects={setProjects} notify={notify} onCreateProject={() => navigate('projects')} />}
         {page === 'projects' && <ProjectsPage projects={projects} onProjects={setProjects} notify={notify} canManage={session.accountRole === 'admin' || session.permissions.includes('project_create')} canEngineer={session.accountRole === 'admin' || session.permissions.includes('engineering')} onDesignRoute={(project) => { setEngineeringProjectId(project.id); navigate('engineering'); }} />}
         {page === 'access' && session.accountRole === 'admin' && <AccessMatrixPage notify={notify} />}
@@ -237,15 +237,15 @@ function ReworkDecisionModal({ onClose, onSubmit }: { onClose: () => void; onSub
 }
 
 function EmptyPage({ eyebrow, title, text, icon, action }: { eyebrow: string; title: string; text: string; icon: React.ReactNode; action?: React.ReactNode }) {
-  return <><PageHeader eyebrow={eyebrow} title={title} /><EmptyCanvas title={title} text={text} icon={icon} action={action} /></>;
+  return <><PageHeader eyebrow="فضای کاری" title={eyebrow} /><EmptyCanvas title={title} text={text} icon={icon} action={action} /></>;
 }
 
 function EmptyCanvas({ title, text, icon, action }: { title: string; text: string; icon: React.ReactNode; action?: React.ReactNode }) {
-  return <section className="empty-canvas"><div className="empty-visual"><span>{icon}</span><i /><i /><i /></div><h2>{title}</h2><p>{text}</p>{action}</section>;
+  return <section className="empty-canvas"><div className="empty-signal"><div className="empty-visual"><span>{icon}</span><i /><i /><i /></div><span className="empty-state-label"><i /> وضعیت فعلی</span></div><div className="empty-copy"><h2>{title}</h2><p>{text}</p>{action}</div><div className="empty-track" aria-hidden="true"><i /><i /><i /><i /><span /></div></section>;
 }
 
-function FlowPage({ projects, onProjects }: { projects: Project[]; onProjects: () => void }) {
-  if (!projects.length) return <EmptyPage eyebrow="جریان تولید" title="هنوز جریانی ساخته نشده" text="ابتدا پروژه را تعریف کنید؛ مسیر واقعی همان پروژه در این بخش تشکیل می‌شود." icon={<Activity size={32} />} action={<button className="empty-action" type="button" onClick={onProjects}><FilePlus2 size={17} /> تعریف پروژه</button>} />;
+function FlowPage({ projects, onProjects, canCreateProject }: { projects: Project[]; onProjects: () => void; canCreateProject: boolean }) {
+  if (!projects.length) return <EmptyPage eyebrow="جریان تولید" title="هنوز جریانی ساخته نشده" text="پس از تعریف پروژه و مسیر مهندسی، جریان واقعی تولید در این بخش نمایش داده می‌شود." icon={<Activity size={32} />} action={canCreateProject ? <button className="empty-action" type="button" onClick={onProjects}><FilePlus2 size={17} /> تعریف پروژه</button> : undefined} />;
   return <><PageHeader eyebrow="جریان تولید" title="پروژه‌های ثبت‌شده" /><section className="entity-grid">{projects.map((project) => <article className="entity-card" key={project.id}><span className="entity-icon"><FolderKanban size={22} /></span><small>{project.code}</small><h3>{project.name}</h3><p>{project.itemType === 'assembly' ? 'مونتاژی' : 'تکی'} · {project.drawings.length.toLocaleString('fa-IR')} نقشه · {(project.sets?.length || 0).toLocaleString('fa-IR')} مجموعه</p></article>)}</section></>;
 }
 
@@ -265,6 +265,7 @@ function AccessMatrixPage({ notify }: { notify: (message: string) => void }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [newUserOpen, setNewUserOpen] = useState(false);
+  const [deleteUser, setDeleteUser] = useState<AccessUser | null>(null);
   useEffect(() => {
     apiFetch('/api/admin/access-matrix').then(async (response) => {
       const data = await response.json();
@@ -315,12 +316,18 @@ function AccessMatrixPage({ notify }: { notify: (message: string) => void }) {
     if (!response.ok) { notify(data.error || 'کاربر ایجاد نشد.'); return; }
     setUsers((current) => [...current, data.user]); setNewUserOpen(false); notify('کاربر محلی ایجاد شد؛ دسترسی‌های او را در همین صفحه تنظیم کنید.');
   };
+  const removeUser = async (user: AccessUser) => {
+    const response = await apiFetch(`/api/admin/users/${encodeURIComponent(user.username)}`, { method: 'DELETE' });
+    const data = await response.json();
+    if (!response.ok) { notify(data.error || 'کاربر حذف نشد.'); return; }
+    setUsers((current) => current.filter((item) => item.username !== user.username)); setDeleteUser(null); notify(`کاربر «${user.displayName}» حذف شد.`);
+  };
   return <>
     <PageHeader eyebrow="مدیریت سامانه" title="ماتریس دسترسی کاربران"><div className="access-heading-actions"><button className="heading-action secondary" type="button" onClick={() => setNewUserOpen(true)}><Plus size={17} /> کاربر محلی جدید</button><button className="heading-action access-save" type="button" onClick={() => void save()} disabled={saving}><Save size={17} /> {saving ? 'در حال ذخیره' : 'ذخیره دسترسی‌ها'}</button></div></PageHeader>
     <section className="access-overview"><div><span className="access-overview-icon"><ShieldCheck size={23} /></span><span><b>کنترل نقش‌محور ماژول‌ها</b><small>هر کاربر فقط ماژول‌های مجاز خود را می‌بیند و مفهوم اسکن از نقش عملیاتی او تعیین می‌شود.</small></span></div><div className="access-legend"><span><i className="green" />فعال</span><span><i />غیرفعال</span></div></section>
     {loading ? <section className="access-loading">در حال دریافت کاربران…</section> : <section className="access-matrix">
       {users.map((user) => <article className={`access-user ${user.isAdmin ? 'system-admin' : ''}`} key={user.username}>
-        <header><span className="access-avatar"><UserRound size={19} /></span><span><b>{user.displayName}</b><small>{user.username}</small></span>{user.isAdmin && <em><KeyRound size={13} /> مدیر کل</em>}</header>
+        <header><span className="access-avatar"><UserRound size={19} /></span><span><b>{user.displayName}</b><small>{user.username}</small></span>{user.isAdmin ? <em><KeyRound size={13} /> مدیر کل</em> : <button className="delete-user" type="button" onClick={() => setDeleteUser(user)}><Trash2 size={14} /> حذف کاربر</button>}</header>
         <div className="access-role"><label>نقش عملیاتی<select value={user.role} disabled={user.isAdmin} onChange={(event) => changeRole(user, event.target.value as RoleId)}>{user.isAdmin ? <option value="admin">مدیر کل سامانه</option> : roles.map((role) => <option key={role.id} value={role.id}>{role.title}</option>)}</select></label><span><small>مفهوم بارکدخوان</small><b>{user.isAdmin ? 'تمام عملیات‌ها' : roles.find((role) => role.id === user.role)?.action}</b></span></div>
         <div className="access-permissions">{permissionOptions.map((permission) => { const active = user.isAdmin || user.permissions.includes(permission.id); return <button type="button" key={permission.id} disabled={user.isAdmin} className={active ? 'active' : ''} onClick={() => togglePermission(user, permission.id)}><span>{active ? <Check size={14} /> : null}</span><b>{permission.title}</b><small>{permission.group}</small></button>; })}</div>
         {!user.isAdmin && user.role === 'operator' && <label className="operator-scope"><span>حوزه اپراتور / نام مجموعه مسئول</span><input value={user.scope} onChange={(event) => patchUser(user.username, { scope: event.target.value })} placeholder="مثلاً: جوش یا مونتاژ" /></label>}
@@ -328,7 +335,12 @@ function AccessMatrixPage({ notify }: { notify: (message: string) => void }) {
       {!users.length && <div className="access-loading"><UsersRound size={28} /> کاربری برای تخصیص دسترسی ثبت نشده است.</div>}
     </section>}
     {newUserOpen && <NewAccessUserModal onClose={() => setNewUserOpen(false)} onCreate={(input) => void createUser(input)} />}
+    {deleteUser && <DeleteAccessUserModal user={deleteUser} onClose={() => setDeleteUser(null)} onDelete={() => void removeUser(deleteUser)} />}
   </>;
+}
+
+function DeleteAccessUserModal({ user, onClose, onDelete }: { user: AccessUser; onClose: () => void; onDelete: () => void }) {
+  return <div className="modal-layer"><button className="modal-scrim" type="button" onClick={onClose} /><section className="forge-modal small delete-project-modal"><header><div><span>مدیریت کاربران</span><h2>حذف کاربر محلی</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header><div className="delete-warning"><span><Trash2 size={23} /></span><div><b>{user.displayName}</b><small>دسترسی کاربر «{user.username}» به سامانه بلافاصله قطع می‌شود.</small></div></div><footer><button type="button" onClick={onClose}>انصراف</button><button className="danger" type="button" onClick={onDelete}><Trash2 size={15} /> حذف کاربر</button></footer></section></div>;
 }
 
 function NewAccessUserModal({ onClose, onCreate }: { onClose: () => void; onCreate: (input: { username: string; displayName: string; password: string; role: RoleId }) => void }) {
