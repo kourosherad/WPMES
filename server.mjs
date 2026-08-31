@@ -5,7 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode, saveProjectProfile as saveDatabaseProjectProfile } from './database.mjs';
+import { archiveProject as archiveDatabaseProject, confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode, saveProjectProfile as saveDatabaseProjectProfile } from './database.mjs';
 
 const appRoot = fileURLToPath(new URL('.', import.meta.url));
 const root = join(appRoot, 'dist');
@@ -351,7 +351,7 @@ async function handleApi(req, res, pathname) {
       return true;
     }
     const state = await loadState();
-    sendJson(res, 200, { projects: state.projects.map((project) => ({ ...project, sets: Array.isArray(project.sets) ? project.sets : [] })) });
+    sendJson(res, 200, { projects: state.projects.filter((project) => !project.archived).map((project) => ({ ...project, sets: Array.isArray(project.sets) ? project.sets : [] })) });
     return true;
   }
   if (pathname === '/api/projects' && req.method === 'POST') {
@@ -448,6 +448,22 @@ async function handleApi(req, res, pathname) {
       await saveState(state);
     }
     sendJson(res, 200, { deleted: true, id });
+    return true;
+  }
+  if (pathname.startsWith('/api/projects/') && pathname.endsWith('/archive') && req.method === 'POST') {
+    if (!hasPermission(req.authUser, 'project_create')) { sendJson(res, 403, { error: 'دسترسی بایگانی پروژه برای این کاربر فعال نیست.' }); return true; }
+    const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/archive'.length));
+    if (!id || id.includes('/')) { sendJson(res, 400, { error: 'شناسه پروژه معتبر نیست.' }); return true; }
+    if (databaseConfigured()) {
+      await archiveDatabaseProject(id, req.authUser);
+    } else {
+      const state = await loadState();
+      const index = state.projects.findIndex((project) => project.id === id);
+      if (index < 0) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
+      state.projects[index] = { ...state.projects[index], archived: true, archivedAt: new Date().toISOString() };
+      await saveState(state);
+    }
+    sendJson(res, 200, { archived: true, id });
     return true;
   }
   if (pathname === '/api/work-items' && req.method === 'POST') {

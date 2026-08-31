@@ -48,5 +48,10 @@ const hold = await pool.request().input('code', sql.NVarChar(160), independentCo
     (SELECT TOP (1) Status FROM production.ReworkCases Cases WHERE Cases.WorkItemId=WorkItems.Id ORDER BY CreatedAtUtc DESC) AS ReworkStatus
   FROM production.WorkItems WorkItems JOIN production.Barcodes Barcodes ON Barcodes.WorkItemId=WorkItems.Id WHERE Barcodes.BarcodeValue=@code;`);
 if (hold.recordset[0].CurrentStatus !== 'ON_HOLD' || hold.recordset[0].ReworkStatus !== 'AWAITING_ROUTE') throw new Error(`INDEPENDENT_REWORK_ASSERTION_FAILED:${JSON.stringify(hold.recordset[0])}`);
-console.log(JSON.stringify({ operatorResolution: { set: resolvedWeld.set.name, processes: resolvedWeld.processes.length, wrongStationBlocked: true }, completed: { status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }, independentRework: hold.recordset[0] }));
+await database.archiveProject(project.id, engineering);
+const activeProject = await database.listProjects(project.id);
+const archivedProject = await database.listProjects(project.id, true);
+const archivedBarcode = await database.resolveBarcode(code, weldOperator);
+if (activeProject.length || archivedProject.length !== 1 || archivedBarcode) throw new Error(`PROJECT_ARCHIVE_ASSERTION_FAILED:${JSON.stringify({ activeProject, archivedProjectCount: archivedProject.length, archivedBarcode })}`);
+console.log(JSON.stringify({ operatorResolution: { set: resolvedWeld.set.name, processes: resolvedWeld.processes.length, wrongStationBlocked: true }, completed: { status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }, independentRework: hold.recordset[0], archive: { hiddenFromActiveProjects: true, productionHistoryPreserved: Number(row.ScanCount) === 8, barcodeDisabled: true } }));
 await pool.close();

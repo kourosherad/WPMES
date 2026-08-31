@@ -135,16 +135,16 @@ function assembleProjects(result) {
   });
 }
 
-export async function listProjects(projectId = null) {
+export async function listProjects(projectId = null, includeArchived = false) {
   const pool = await databasePool();
-  const request = pool.request().input('projectId', sql.UniqueIdentifier, projectId);
+  const request = pool.request().input('projectId', sql.UniqueIdentifier, projectId).input('includeArchived', sql.Bit, includeArchived);
   const result = await request.query(`
     SELECT Id, ProjectCode, ProjectName, ItemType, CreatedAtUtc, UpdatedAtUtc
-      FROM core.Projects WHERE @projectId IS NULL OR Id = @projectId ORDER BY CreatedAtUtc;
+      FROM core.Projects WHERE (@projectId IS NULL OR Id = @projectId) AND (@includeArchived=1 OR Status<>'CANCELLED') ORDER BY CreatedAtUtc;
     SELECT ProjectId, DrawingNumber FROM core.Drawings
-      WHERE @projectId IS NULL OR ProjectId = @projectId ORDER BY CreatedAtUtc;
+      WHERE (@projectId IS NULL OR ProjectId = @projectId) AND ProjectId IN (SELECT Id FROM core.Projects WHERE @includeArchived=1 OR Status<>'CANCELLED') ORDER BY CreatedAtUtc;
     SELECT Id, ProjectId, ItemCode, ItemName, ItemType, SetOrder, OperatorRoleKey
-      FROM engineering.ItemDefinitions WHERE @projectId IS NULL OR ProjectId = @projectId ORDER BY ProjectId, SetOrder;
+      FROM engineering.ItemDefinitions WHERE (@projectId IS NULL OR ProjectId = @projectId) AND ProjectId IN (SELECT Id FROM core.Projects WHERE @includeArchived=1 OR Status<>'CANCELLED') ORDER BY ProjectId, SetOrder;
     SELECT Steps.Id, Items.Id AS ItemDefinitionId, Steps.StepName, Steps.ExecutionType,
            Steps.RequiresQcApproval, Steps.RequiresProductionControl, Steps.BarcodePolicy
       FROM engineering.RouteSteps Steps
@@ -152,11 +152,37 @@ export async function listProjects(projectId = null) {
       JOIN engineering.ItemDefinitions Items ON Items.Id = Routes.ItemDefinitionId
       WHERE Routes.VersionNumber = (SELECT MAX(CurrentRoute.VersionNumber) FROM engineering.RouteDefinitions CurrentRoute WHERE CurrentRoute.ItemDefinitionId = Items.Id)
         AND (@projectId IS NULL OR Items.ProjectId = @projectId)
+        AND Items.ProjectId IN (SELECT Id FROM core.Projects WHERE @includeArchived=1 OR Status<>'CANCELLED')
       ORDER BY Items.ProjectId, Items.SetOrder, Steps.StepOrder;
     SELECT ProjectId, MainDrawingNumber, ProfileJson, SourceFileName, ImportedRowCount, UpdatedAtUtc
-      FROM core.ProjectProfiles WHERE @projectId IS NULL OR ProjectId = @projectId;
+      FROM core.ProjectProfiles WHERE (@projectId IS NULL OR ProjectId = @projectId) AND ProjectId IN (SELECT Id FROM core.Projects WHERE @includeArchived=1 OR Status<>'CANCELLED');
   `);
   return assembleProjects(result);
+}
+
+export async function archiveProject(projectId, actor) {
+  const pool = await databasePool();
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const identity = await ensureIdentity(new sql.Request(transaction), actor);
+    const projectResult = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
+      .query('SELECT ProjectCode, ProjectName, Status FROM core.Projects WITH (UPDLOCK, HOLDLOCK) WHERE Id=@projectId;');
+    if (!projectResult.recordset.length) { const error = new Error('PROJECT_NOT_FOUND'); error.statusCode = 404; throw error; }
+    await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
+      .query("UPDATE core.Projects SET Status='CANCELLED', UpdatedAtUtc=SYSUTCDATETIME() WHERE Id=@projectId;");
+    await new sql.Request(transaction)
+      .input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
+      .input('correlationId', sql.UniqueIdentifier, randomUUID()).input('entityId', sql.NVarChar(100), projectId)
+      .input('before', sql.NVarChar(sql.MAX), JSON.stringify(projectResult.recordset[0]))
+      .query(`INSERT INTO ops.AuditLogs (ActorUserId, ActorRoleId, EventType, EntityType, EntityId, CorrelationId, BeforeJson)
+              VALUES (@userId,@roleId,'PROJECT_ARCHIVED','PROJECT',@entityId,@correlationId,@before);`);
+    await transaction.commit();
+    return { id: projectId, archived: true };
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  }
 }
 
 export async function createProject(input, actor) {
@@ -456,7 +482,7 @@ async function barcodeContext(request, code, lock = false) {
       Executions.Id AS StepExecutionId, Executions.Status AS ExecutionStatus
     FROM production.Barcodes Barcodes ${lock ? 'WITH (UPDLOCK, HOLDLOCK)' : ''}
     JOIN production.WorkItems WorkItems ${lock ? 'WITH (UPDLOCK, HOLDLOCK)' : ''} ON WorkItems.Id = Barcodes.WorkItemId
-    JOIN core.Projects Projects ON Projects.Id = WorkItems.ProjectId
+    JOIN core.Projects Projects ON Projects.Id = WorkItems.ProjectId AND Projects.Status<>'CANCELLED'
     JOIN engineering.ItemDefinitions Items ON Items.Id = WorkItems.ItemDefinitionId
     LEFT JOIN engineering.RouteSteps Steps ON Steps.Id = WorkItems.CurrentRouteStepId
     LEFT JOIN production.StepExecutions Executions ${lock ? 'WITH (UPDLOCK, HOLDLOCK)' : ''}
