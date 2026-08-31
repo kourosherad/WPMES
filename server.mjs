@@ -281,18 +281,19 @@ async function handleApi(req, res, pathname) {
     const username = String(input?.username || '').trim().toLowerCase();
     const displayName = String(input?.displayName || '').trim();
     const role = String(input?.role || 'operator');
+    const scope = String(input?.scope || '').trim().slice(0, 120);
     const password = String(input?.password || '');
     const validRoles = new Set(['operator', 'qc', 'production', 'packaging', 'engineering']);
-    if (!/^[a-z0-9._-]{3,60}$/.test(username) || displayName.length < 2 || !validRoles.has(role) || password.length < 10) {
-      sendJson(res, 422, { error: 'نام، نام کاربری انگلیسی، نقش و رمز حداقل ۱۰ کاراکتری الزامی است.' }); return true;
+    if (!/^[a-z0-9._-]{3,60}$/.test(username) || displayName.length < 2 || !validRoles.has(role) || password.length < 10 || (role === 'operator' && scope.length < 2)) {
+      sendJson(res, 422, { error: role === 'operator' ? 'برای اپراتور تولید، انتخاب مجموعه مسئول الزامی است.' : 'نام، نام کاربری انگلیسی، نقش و رمز حداقل ۱۰ کاراکتری الزامی است.' }); return true;
     }
     const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
     const users = authUsers(config);
     if (users.some((user) => user.username.toLowerCase() === username)) { sendJson(res, 409, { error: 'این نام کاربری قبلاً ثبت شده است.' }); return true; }
-    const user = { username, displayName, role, scope: null, permissions: rolePermissionDefaults[role] || [], passwordHash: passwordHash(password) };
+    const user = { username, displayName, role, scope: role === 'operator' ? scope : null, permissions: rolePermissionDefaults[role] || [], passwordHash: passwordHash(password) };
     config.users = [...users, user];
     await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
-    sendJson(res, 201, { user: { username, displayName, role, scope: '', permissions: user.permissions, isAdmin: false } });
+    sendJson(res, 201, { user: { username, displayName, role, scope: user.scope || '', permissions: user.permissions, isAdmin: false } });
     return true;
   }
   if (pathname.startsWith('/api/admin/users/') && req.method === 'DELETE') {
@@ -456,9 +457,16 @@ async function handleApi(req, res, pathname) {
     if (!input || typeof input.projectId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2) {
       sendJson(res, 422, { error: 'پروژه و شماره سریال الزامی است.' }); return true;
     }
+    let project = (await listProjects(input.projectId))[0];
+    if (!project) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
+    let routeInitialized = false;
+    if (project.itemType === 'assembly' && !project.sets.length) {
+      project = await replaceProjectRoute(project.id, defaultAssemblySets(), req.authUser);
+      routeInitialized = true;
+    }
     const barcode = `WPMES-${Date.now().toString(36)}-${randomBytes(5).toString('hex')}`.toUpperCase();
     const item = await issueWorkItem({ projectId: input.projectId, serialNumber: input.serialNumber.trim(), barcode }, req.authUser);
-    sendJson(res, 201, { item });
+    sendJson(res, 201, { item, project, routeInitialized });
     return true;
   }
   if (pathname === '/api/scan/confirm' && req.method === 'POST') {

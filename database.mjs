@@ -433,13 +433,14 @@ function actionFor(context, actor) {
   return { allowed: false, reason: 'ROLE_CANNOT_SCAN' };
 }
 
-function publicScanContext(row, action) {
+function publicScanContext(row, action, processes = []) {
   return {
     code: row.BarcodeValue, project: { id: String(row.ProjectId), code: row.ProjectCode, name: row.ProjectName },
     set: { id: String(row.ItemDefinitionId), code: row.SetCode, name: row.SetName },
     step: row.RouteStepId ? { id: String(row.RouteStepId), name: row.StepName } : null,
     serialNumber: row.SerialNumber, status: row.WorkItemStatus,
     executionStatus: row.ExecutionStatus, allowed: action.allowed,
+    processes,
     action: action.allowed ? { code: action.code, title: action.title } : null,
     rejectionReason: action.allowed ? null : action.reason,
   };
@@ -469,7 +470,28 @@ export async function resolveBarcode(code, actor) {
   const result = await barcodeContext(pool.request(), code, false);
   const row = result.recordset[0];
   if (!row) return null;
-  return publicScanContext(row, actionFor(row, actor));
+  const processResult = await pool.request()
+    .input('routeId', sql.UniqueIdentifier, row.RouteDefinitionId)
+    .input('workItemId', sql.UniqueIdentifier, row.WorkItemId)
+    .input('currentStepId', sql.UniqueIdentifier, row.RouteStepId)
+    .query(`SELECT Steps.Id, Steps.StepOrder, Steps.StepName, Steps.ExecutionType,
+        CASE WHEN Steps.Id=@currentStepId THEN 1 ELSE 0 END AS IsCurrent,
+        LatestExecution.Status AS ExecutionStatus
+      FROM engineering.RouteSteps Steps
+      OUTER APPLY (
+        SELECT TOP (1) Executions.Status
+        FROM production.StepExecutions Executions
+        WHERE Executions.WorkItemId=@workItemId AND Executions.RouteStepId=Steps.Id
+        ORDER BY Executions.AttemptNumber DESC
+      ) LatestExecution
+      WHERE Steps.RouteDefinitionId=@routeId
+      ORDER BY Steps.StepOrder;`);
+  const processes = processResult.recordset.map((step) => ({
+    id: String(step.Id), order: Number(step.StepOrder), name: step.StepName,
+    execution: step.ExecutionType === 'EXTERNAL' ? 'external' : 'internal',
+    status: step.ExecutionStatus || 'PENDING', current: Boolean(step.IsCurrent),
+  }));
+  return publicScanContext(row, actionFor(row, actor), processes);
 }
 
 async function ensureScanSession(request, identity, actor) {

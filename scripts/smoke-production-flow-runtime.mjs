@@ -12,6 +12,12 @@ await database.replaceProjectRoute(project.id, [
 
 const code = `SMOKE-${Date.now()}`;
 await database.issueWorkItem({ projectId: project.id, serialNumber: 'SMOKE-SERIAL', barcode: code }, engineering);
+const resolvedWeld = await database.resolveBarcode(code, { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' });
+if (!resolvedWeld?.allowed || resolvedWeld.set.name !== 'Smoke Weld' || resolvedWeld.processes.length !== 1 || resolvedWeld.processes[0].name !== 'Smoke Weld Step' || !resolvedWeld.processes[0].current) {
+  throw new Error(`OPERATOR_PROCESS_RESOLUTION_FAILED:${JSON.stringify(resolvedWeld)}`);
+}
+const wrongStation = await database.resolveBarcode(code, { username: 'smoke.other', displayName: 'Other Station', role: 'operator', scope: 'OTHER_SCOPE' });
+if (wrongStation?.allowed || wrongStation?.rejectionReason !== 'OPERATOR_NOT_ASSIGNED') throw new Error(`OPERATOR_SCOPE_ASSERTION_FAILED:${JSON.stringify(wrongStation)}`);
 const actors = [
   { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' },
   { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc', decision: 'reject', reworkMode: 'same_step', comment: 'Smoke same-step repair' },
@@ -42,5 +48,5 @@ const hold = await pool.request().input('code', sql.NVarChar(160), independentCo
     (SELECT TOP (1) Status FROM production.ReworkCases Cases WHERE Cases.WorkItemId=WorkItems.Id ORDER BY CreatedAtUtc DESC) AS ReworkStatus
   FROM production.WorkItems WorkItems JOIN production.Barcodes Barcodes ON Barcodes.WorkItemId=WorkItems.Id WHERE Barcodes.BarcodeValue=@code;`);
 if (hold.recordset[0].CurrentStatus !== 'ON_HOLD' || hold.recordset[0].ReworkStatus !== 'AWAITING_ROUTE') throw new Error(`INDEPENDENT_REWORK_ASSERTION_FAILED:${JSON.stringify(hold.recordset[0])}`);
-console.log(JSON.stringify({ completed: { status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }, independentRework: hold.recordset[0] }));
+console.log(JSON.stringify({ operatorResolution: { set: resolvedWeld.set.name, processes: resolvedWeld.processes.length, wrongStationBlocked: true }, completed: { status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }, independentRework: hold.recordset[0] }));
 await pool.close();
