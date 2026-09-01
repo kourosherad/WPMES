@@ -52,7 +52,7 @@ export async function databaseHealth() {
 }
 
 const roleCodes = {
-  operator: 'OPERATOR', qc: 'QUALITY_CONTROL', production: 'PRODUCTION_CONTROL',
+  operator: 'PRODUCTION_CONTROL', qc: 'QUALITY_CONTROL', production: 'PRODUCTION_CONTROL',
   packaging: 'PACKAGING', engineering: 'ENGINEERING', admin: 'SYSTEM_ADMIN',
 };
 
@@ -119,7 +119,7 @@ function assembleProjects(result) {
     sets.get(projectKey).push({
       id: String(row.Id), name: row.ItemName, code: row.ItemCode,
       kind: row.ItemType === 'SINGLE' ? 'single' : 'assembly',
-      operatorRole: row.OperatorRoleKey || 'اپراتور تولید',
+      operatorRole: row.OperatorRoleKey || 'کنترل تولید',
       steps: steps.get(String(row.Id).toLowerCase()) || [],
     });
   }
@@ -432,30 +432,43 @@ export async function issueWorkItem(input, actor) {
   }
 }
 
+export async function listProjectWorkItems(projectId) {
+  const pool = await databasePool();
+  const result = await pool.request().input('projectId', sql.UniqueIdentifier, projectId).query(`
+    SELECT WorkItems.Id, WorkItems.SerialNumber, WorkItems.CurrentStatus, WorkItems.CreatedAtUtc,
+      WorkItems.CompletedAtUtc, Barcodes.BarcodeValue, Barcodes.IssuedAtUtc,
+      Items.ItemName AS CurrentSetName, Steps.StepName AS CurrentStepName
+    FROM production.WorkItems WorkItems
+    JOIN core.Projects Projects ON Projects.Id=WorkItems.ProjectId
+    JOIN production.Barcodes Barcodes ON Barcodes.WorkItemId=WorkItems.Id AND Barcodes.Status='ACTIVE'
+    LEFT JOIN engineering.ItemDefinitions Items ON Items.Id=WorkItems.ItemDefinitionId
+    LEFT JOIN engineering.RouteSteps Steps ON Steps.Id=WorkItems.CurrentRouteStepId
+    WHERE WorkItems.ProjectId=@projectId
+    ORDER BY Barcodes.IssuedAtUtc DESC;
+  `);
+  return result.recordset.map((row) => ({
+    id: String(row.Id), serialNumber: row.SerialNumber, barcode: row.BarcodeValue,
+    status: row.CurrentStatus, currentSet: row.CurrentSetName || null, currentStep: row.CurrentStepName || null,
+    issuedAt: row.IssuedAtUtc, completedAt: row.CompletedAtUtc || null,
+  }));
+}
+
 function stationKey(value) {
   return String(value || '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLocaleLowerCase('fa-IR');
 }
 
 function actionFor(context, actor) {
   if (!context) return { allowed: false, reason: 'BARCODE_NOT_FOUND' };
-  if (actor.role === 'operator') {
-    if (!actor.scope) return { allowed: false, reason: 'OPERATOR_ASSIGNMENT_REQUIRED' };
-    if (actor.accountRole !== 'admin' && stationKey(actor.scope) !== stationKey(context.OperatorRoleKey)) return { allowed: false, reason: 'OPERATOR_NOT_ASSIGNED' };
-    if (!['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)) return { allowed: false, reason: 'STEP_NOT_READY' };
-    return { allowed: true, code: 'OPERATOR_COMPLETE', title: `ثبت اتمام «${context.SetName}»` };
-  }
-  if (actor.role === 'packaging') {
-    const station = `${context.SetName || ''} ${context.OperatorRoleKey || ''}`;
-    if (!/پکیج|بسته.?بندی/i.test(station)) return { allowed: false, reason: 'OPERATOR_NOT_ASSIGNED' };
-    if (!['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)) return { allowed: false, reason: 'STEP_NOT_READY' };
-    return { allowed: true, code: 'OPERATOR_COMPLETE', title: `ثبت اتمام «${context.SetName}»` };
-  }
   if (actor.role === 'qc') return context.ExecutionStatus === 'WAITING_QC'
     ? { allowed: true, code: 'QC_APPROVE', title: 'تأیید کنترل کیفیت' }
     : { allowed: false, reason: 'QC_NOT_READY' };
-  if (actor.role === 'production') return context.ExecutionStatus === 'WAITING_PRODUCTION_CONTROL'
-    ? { allowed: true, code: 'PRODUCTION_APPROVE', title: 'تأیید کنترل تولید' }
-    : { allowed: false, reason: 'PRODUCTION_CONTROL_NOT_READY' };
+  if (actor.role === 'production' || actor.role === 'operator' || actor.role === 'packaging') {
+    if (!actor.scope) return { allowed: false, reason: 'PRODUCTION_STATION_REQUIRED' };
+    if (actor.accountRole !== 'admin' && stationKey(actor.scope) !== stationKey(context.OperatorRoleKey)) return { allowed: false, reason: 'PRODUCTION_STATION_MISMATCH' };
+    if (['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)) return { allowed: true, code: 'PRODUCTION_OPERATION_COMPLETE', title: `ثبت اتمام «${context.SetName}» توسط کنترل تولید` };
+    if (context.ExecutionStatus === 'WAITING_PRODUCTION_CONTROL') return { allowed: true, code: 'PRODUCTION_APPROVE', title: 'تأیید نهایی کنترل تولید' };
+    return { allowed: false, reason: 'PRODUCTION_CONTROL_NOT_READY' };
+  }
   return { allowed: false, reason: 'ROLE_CANNOT_SCAN' };
 }
 
@@ -563,10 +576,10 @@ export async function confirmBarcode(input, actor) {
     }
     if (!action.allowed) { const error = new Error(action.reason); error.statusCode = 409; throw error; }
     const scanSessionId = await ensureScanSession(new sql.Request(transaction), identity, actor);
-    if (action.code === 'OPERATOR_COMPLETE') {
+    if (action.code === 'PRODUCTION_OPERATION_COMPLETE') {
       const nextStatus = row.RequiresQcApproval ? 'WAITING_QC' : row.RequiresProductionControl ? 'WAITING_PRODUCTION_CONTROL' : 'COMPLETED';
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId).input('status', sql.VarChar(40), nextStatus)
-        .query(`UPDATE production.StepExecutions SET Status=@status, OperatorCompletedAtUtc=SYSUTCDATETIME(), StartedAtUtc=COALESCE(StartedAtUtc,SYSUTCDATETIME()) WHERE Id=@executionId;`);
+        .query(`UPDATE production.StepExecutions SET Status=@status, ProductionOperationCompletedAtUtc=SYSUTCDATETIME(), StartedAtUtc=COALESCE(StartedAtUtc,SYSUTCDATETIME()) WHERE Id=@executionId;`);
     } else if (action.code === 'QC_APPROVE') {
       const nextStatus = row.RequiresProductionControl ? 'WAITING_PRODUCTION_CONTROL' : 'COMPLETED';
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId).input('status', sql.VarChar(40), nextStatus)
@@ -648,7 +661,7 @@ export async function confirmBarcode(input, actor) {
       .query(`INSERT INTO production.ScanEvents (ClientRequestId, ScanSessionId, WorkItemId, BarcodeId, StepExecutionId, InputSource, RawCode, ResolvedAction, Result, ManualEntryReason)
               VALUES (@requestId,@sessionId,@workItemId,@barcodeId,@executionId,@source,@code,@action,'ACCEPTED',@manualReason);`);
     {
-      const approvalType = { OPERATOR_COMPLETE: 'OPERATOR', QC_APPROVE: 'QUALITY_CONTROL', QC_REJECT: 'QUALITY_CONTROL', PRODUCTION_APPROVE: 'PRODUCTION_CONTROL' }[action.code];
+      const approvalType = { PRODUCTION_OPERATION_COMPLETE: 'PRODUCTION_CONTROL', QC_APPROVE: 'QUALITY_CONTROL', QC_REJECT: 'QUALITY_CONTROL', PRODUCTION_APPROVE: 'PRODUCTION_CONTROL' }[action.code];
       const decision = action.code === 'QC_REJECT' ? 'REJECTED' : 'APPROVED';
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
         .input('type', sql.VarChar(30), approvalType).input('decision', sql.VarChar(30), decision)

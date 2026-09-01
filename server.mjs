@@ -5,7 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { archiveProject as archiveDatabaseProject, confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, replaceProjectRoute, resolveBarcode, saveProjectProfile as saveDatabaseProjectProfile } from './database.mjs';
+import { archiveProject as archiveDatabaseProject, confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, listProjectWorkItems, replaceProjectRoute, resolveBarcode, saveProjectProfile as saveDatabaseProjectProfile } from './database.mjs';
 
 const appRoot = fileURLToPath(new URL('.', import.meta.url));
 const root = join(appRoot, 'dist');
@@ -49,7 +49,18 @@ function constantTimeMatch(left, right) {
 }
 
 function authUsers(config) {
-  if (Array.isArray(config.users)) return config.users.filter((user) => user && user.username && (user.password || user.passwordHash) && user.role);
+  if (Array.isArray(config.users)) return config.users
+    .filter((user) => user && user.username && (user.password || user.passwordHash) && user.role)
+    .map((user) => {
+      if (!['operator', 'packaging'].includes(user.role)) return user;
+      return {
+        ...user,
+        role: 'production',
+        scope: user.scope || (user.role === 'packaging' ? 'بسته‌بندی' : null),
+        permissions: [...new Set([...(Array.isArray(user.permissions) ? user.permissions : []), 'scanner', 'production_control'])]
+          .filter((permission) => permission !== 'packaging'),
+      };
+    });
   if (config.username && config.password) return [{ username: config.username, password: config.password, displayName: 'کاربر مهندسی', role: 'engineering' }];
   return [];
 }
@@ -72,7 +83,7 @@ function passwordMatches(user, password) {
 
 const permissionCatalog = new Set(['projects', 'project_create', 'engineering', 'production_flow', 'scanner', 'qc', 'production_control', 'packaging', 'access_matrix']);
 const rolePermissionDefaults = {
-  operator: ['scanner'], qc: ['projects', 'scanner', 'qc'], production: ['scanner', 'production_control'],
+  operator: ['scanner', 'production_control'], qc: ['projects', 'scanner', 'qc'], production: ['scanner', 'production_control'],
   packaging: ['scanner', 'packaging'], engineering: ['projects', 'engineering'],
   admin: [...permissionCatalog],
 };
@@ -122,13 +133,13 @@ function validSession(req, config) {
   return { username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || null, permissions: permissionsFor(user) };
 }
 
-const delegatedAdminRoles = new Set(['engineering', 'operator', 'qc', 'production', 'packaging']);
+const delegatedAdminRoles = new Set(['engineering', 'qc', 'production']);
 
 function requestActor(session, req) {
   if (session.role !== 'admin') return session;
   const requestedRole = String(req.headers['x-wpmes-role'] || 'engineering').toLowerCase();
   const role = delegatedAdminRoles.has(requestedRole) ? requestedRole : 'engineering';
-  return { ...session, role, accountRole: 'admin', scope: role === 'operator' ? '*' : session.scope, permissions: [...permissionCatalog] };
+  return { ...session, role, accountRole: 'admin', scope: role === 'production' ? '*' : session.scope, permissions: [...permissionCatalog] };
 }
 
 function renderLogin(res, invalid = false) {
@@ -261,7 +272,7 @@ async function handleApi(req, res, pathname) {
     if (!input || !Array.isArray(input.users) || input.users.length > 200) { sendJson(res, 422, { error: 'ماتریس دسترسی معتبر نیست.' }); return true; }
     const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
     const updates = new Map(input.users.map((user) => [String(user?.username || ''), user]));
-    const validRoles = new Set(['operator', 'qc', 'production', 'packaging', 'engineering', 'admin']);
+    const validRoles = new Set(['qc', 'production', 'engineering', 'admin']);
     config.users = authUsers(config).map((user) => {
       const update = updates.get(user.username);
       if (!update || user.role === 'admin') return user;
@@ -269,7 +280,7 @@ async function handleApi(req, res, pathname) {
       const permissions = Array.isArray(update.permissions)
         ? [...new Set(update.permissions.map((value) => String(value)).filter((value) => permissionCatalog.has(value) && value !== 'access_matrix'))]
         : permissionsFor(user);
-      return { ...user, role, scope: String(update.scope || '').trim() || null, permissions };
+      return { ...user, role, scope: role === 'production' ? String(update.scope || '').trim() || null : null, permissions };
     });
     await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
     sendJson(res, 200, { users: config.users.map((user) => ({ username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || '', permissions: permissionsFor(user), isAdmin: user.role === 'admin' })) });
@@ -280,17 +291,17 @@ async function handleApi(req, res, pathname) {
     const input = await readJson(req);
     const username = String(input?.username || '').trim().toLowerCase();
     const displayName = String(input?.displayName || '').trim();
-    const role = String(input?.role || 'operator');
+    const role = String(input?.role || 'production');
     const scope = String(input?.scope || '').trim().slice(0, 120);
     const password = String(input?.password || '');
-    const validRoles = new Set(['operator', 'qc', 'production', 'packaging', 'engineering']);
-    if (!/^[a-z0-9._-]{3,60}$/.test(username) || displayName.length < 2 || !validRoles.has(role) || password.length < 10 || (role === 'operator' && scope.length < 2)) {
-      sendJson(res, 422, { error: role === 'operator' ? 'برای اپراتور تولید، انتخاب مجموعه مسئول الزامی است.' : 'نام، نام کاربری انگلیسی، نقش و رمز حداقل ۱۰ کاراکتری الزامی است.' }); return true;
+    const validRoles = new Set(['qc', 'production', 'engineering']);
+    if (!/^[a-z0-9._-]{3,60}$/.test(username) || displayName.length < 2 || !validRoles.has(role) || password.length < 10 || (role === 'production' && scope.length < 2)) {
+      sendJson(res, 422, { error: role === 'production' ? 'برای کنترل تولید، انتخاب مجموعه مسئول الزامی است.' : 'نام، نام کاربری انگلیسی، نقش و رمز حداقل ۱۰ کاراکتری الزامی است.' }); return true;
     }
     const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
     const users = authUsers(config);
     if (users.some((user) => user.username.toLowerCase() === username)) { sendJson(res, 409, { error: 'این نام کاربری قبلاً ثبت شده است.' }); return true; }
-    const user = { username, displayName, role, scope: role === 'operator' ? scope : null, permissions: rolePermissionDefaults[role] || [], passwordHash: passwordHash(password) };
+    const user = { username, displayName, role, scope: role === 'production' ? scope : null, permissions: rolePermissionDefaults[role] || [], passwordHash: passwordHash(password) };
     config.users = [...users, user];
     await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
     sendJson(res, 201, { user: { username, displayName, role, scope: user.scope || '', permissions: user.permissions, isAdmin: false } });
@@ -450,6 +461,16 @@ async function handleApi(req, res, pathname) {
     sendJson(res, 200, { deleted: true, id });
     return true;
   }
+  if (pathname.startsWith('/api/projects/') && pathname.endsWith('/work-items') && req.method === 'GET') {
+    if (!hasPermission(req.authUser, 'projects')) { sendJson(res, 403, { error: 'دسترسی مشاهده شناسه‌های تولید فعال نیست.' }); return true; }
+    if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
+    const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/work-items'.length));
+    if (!id || id.includes('/')) { sendJson(res, 400, { error: 'شناسه پروژه معتبر نیست.' }); return true; }
+    const project = (await listProjects(id))[0];
+    if (!project) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
+    sendJson(res, 200, { items: await listProjectWorkItems(id) });
+    return true;
+  }
   if (pathname.startsWith('/api/projects/') && pathname.endsWith('/archive') && req.method === 'POST') {
     if (!hasPermission(req.authUser, 'project_create')) { sendJson(res, 403, { error: 'دسترسی بایگانی پروژه برای این کاربر فعال نیست.' }); return true; }
     const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/archive'.length));
@@ -542,8 +563,8 @@ async function handle(req, res, isTls) {
   } catch (error) {
     const status = error?.message === 'PAYLOAD_TOO_LARGE' ? 413 : Number(error?.statusCode || (error?.number === 2601 || error?.number === 2627 ? 409 : 400));
     const scanErrors = {
-      BARCODE_NOT_FOUND: 'بارکد فعال پیدا نشد.', OPERATOR_ASSIGNMENT_REQUIRED: 'برای حساب اپراتور، مجموعه مسئولیت تعیین نشده است.',
-      OPERATOR_NOT_ASSIGNED: 'این مجموعه در حوزه مسئولیت اپراتور نیست.', STEP_NOT_READY: 'این مرحله آماده تأیید اپراتور نیست.',
+      BARCODE_NOT_FOUND: 'بارکد فعال پیدا نشد.', PRODUCTION_STATION_REQUIRED: 'برای حساب کنترل تولید، مجموعه مسئول تعیین نشده است.',
+      PRODUCTION_STATION_MISMATCH: 'این مجموعه در حوزه مسئولیت کنترل تولید نیست.', STEP_NOT_READY: 'این مرحله آماده ثبت کنترل تولید نیست.',
       QC_NOT_READY: 'قطعه هنوز در انتظار کنترل کیفیت نیست.', PRODUCTION_CONTROL_NOT_READY: 'قطعه هنوز در انتظار کنترل تولید نیست.',
       PACKAGING_NOT_READY: 'قطعه هنوز وارد مرحله پکیجینگ نشده است.', ROLE_CANNOT_SCAN: 'نقش فعلی مجوز ثبت عملیات اسکن را ندارد.',
       PROJECT_SCOPE_MISMATCH: 'این بارکد متعلق به پروژه انتخاب‌شده نیست.',

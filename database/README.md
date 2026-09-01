@@ -10,13 +10,12 @@ The VM deployment is automated by:
   authentication, and creates the least-privileged `wpmes_app` login.
 - `npm run db:migrate-state` — imports the previous JSON project data once,
   without overwriting an existing project code.
-- `node scripts/smoke-production-flow.mjs` — verifies the complete operator,
-  QC, production-control, and packaging gate in an isolated temporary database.
+- `node scripts/smoke-production-flow.mjs` — verifies the complete station-scoped
+  production-control and QC gates in an isolated temporary database.
 
-Operator accounts may carry a `scope` value in the identity configuration. It
-must match the engineering-defined operator role of a project set; the API
-rejects a scan when the role or scope does not match the current production
-gate.
+Production-control accounts carry a `scope` value in the identity configuration.
+It must match the engineering-defined station of a project set; the API rejects
+a scan when the assigned station does not match the current production gate.
 
 Important deployment rules:
 

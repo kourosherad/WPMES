@@ -12,27 +12,27 @@ await database.replaceProjectRoute(project.id, [
 
 const code = `SMOKE-${Date.now()}`;
 await database.issueWorkItem({ projectId: project.id, serialNumber: 'SMOKE-SERIAL', barcode: code }, engineering);
-const resolvedWeld = await database.resolveBarcode(code, { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' });
+const resolvedWeld = await database.resolveBarcode(code, { username: 'smoke.production.weld', displayName: 'Smoke Production Weld', role: 'production', scope: 'WELD_SCOPE' });
 if (!resolvedWeld?.allowed || resolvedWeld.set.name !== 'Smoke Weld' || resolvedWeld.processes.length !== 1 || resolvedWeld.processes[0].name !== 'Smoke Weld Step' || !resolvedWeld.processes[0].current) {
-  throw new Error(`OPERATOR_PROCESS_RESOLUTION_FAILED:${JSON.stringify(resolvedWeld)}`);
+  throw new Error(`PRODUCTION_PROCESS_RESOLUTION_FAILED:${JSON.stringify(resolvedWeld)}`);
 }
-const wrongStation = await database.resolveBarcode(code, { username: 'smoke.other', displayName: 'Other Station', role: 'operator', scope: 'OTHER_SCOPE' });
-if (wrongStation?.allowed || wrongStation?.rejectionReason !== 'OPERATOR_NOT_ASSIGNED') throw new Error(`OPERATOR_SCOPE_ASSERTION_FAILED:${JSON.stringify(wrongStation)}`);
+const wrongStation = await database.resolveBarcode(code, { username: 'smoke.production.other', displayName: 'Other Production Station', role: 'production', scope: 'OTHER_SCOPE' });
+if (wrongStation?.allowed || wrongStation?.rejectionReason !== 'PRODUCTION_STATION_MISMATCH') throw new Error(`PRODUCTION_SCOPE_ASSERTION_FAILED:${JSON.stringify(wrongStation)}`);
 const actors = [
-  { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' },
+  { username: 'smoke.production.weld', displayName: 'Smoke Production Weld', role: 'production', scope: 'WELD_SCOPE' },
   { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc', decision: 'reject', reworkMode: 'same_step', comment: 'Smoke same-step repair' },
-  { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' },
+  { username: 'smoke.production.weld', displayName: 'Smoke Production Weld', role: 'production', scope: 'WELD_SCOPE' },
   { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc' },
-  { username: 'smoke.production', displayName: 'Smoke Production', role: 'production' },
-  { username: 'smoke.delivery', displayName: 'Smoke Delivery', role: 'operator', scope: 'DELIVERY_SCOPE' },
+  { username: 'smoke.production.weld', displayName: 'Smoke Production Weld', role: 'production', scope: 'WELD_SCOPE' },
+  { username: 'smoke.production.delivery', displayName: 'Smoke Production Delivery', role: 'production', scope: 'DELIVERY_SCOPE' },
   { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc' },
-  { username: 'smoke.production', displayName: 'Smoke Production', role: 'production' },
+  { username: 'smoke.production.delivery', displayName: 'Smoke Production Delivery', role: 'production', scope: 'DELIVERY_SCOPE' },
 ];
 for (const actor of actors) await database.confirmBarcode({ code, projectId: actor.role === 'qc' ? project.id : null, clientRequestId: randomUUID(), inputSource: 'CAMERA', manualReason: null, decision: actor.decision || 'approve', reworkMode: actor.reworkMode || null, comment: actor.comment || null }, actor);
 
 const independentCode = `SMOKE-HOLD-${Date.now()}`;
 await database.issueWorkItem({ projectId: project.id, serialNumber: 'SMOKE-HOLD-SERIAL', barcode: independentCode }, engineering);
-const weldOperator = { username: 'smoke.operator', displayName: 'Smoke Operator', role: 'operator', scope: 'WELD_SCOPE' };
+const weldOperator = { username: 'smoke.production.weld', displayName: 'Smoke Production Weld', role: 'production', scope: 'WELD_SCOPE' };
 const qualityControl = { username: 'smoke.qc', displayName: 'Smoke QC', role: 'qc' };
 await database.confirmBarcode({ code: independentCode, clientRequestId: randomUUID(), inputSource: 'CAMERA', manualReason: null, decision: 'approve' }, weldOperator);
 await database.confirmBarcode({ code: independentCode, projectId: project.id, clientRequestId: randomUUID(), inputSource: 'CAMERA', manualReason: null, decision: 'reject', reworkMode: 'independent', comment: 'Smoke independent rework route' }, qualityControl);
@@ -53,5 +53,5 @@ const activeProject = await database.listProjects(project.id);
 const archivedProject = await database.listProjects(project.id, true);
 const archivedBarcode = await database.resolveBarcode(code, weldOperator);
 if (activeProject.length || archivedProject.length !== 1 || archivedBarcode) throw new Error(`PROJECT_ARCHIVE_ASSERTION_FAILED:${JSON.stringify({ activeProject, archivedProjectCount: archivedProject.length, archivedBarcode })}`);
-console.log(JSON.stringify({ operatorResolution: { set: resolvedWeld.set.name, processes: resolvedWeld.processes.length, wrongStationBlocked: true }, completed: { status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }, independentRework: hold.recordset[0], archive: { hiddenFromActiveProjects: true, productionHistoryPreserved: Number(row.ScanCount) === 8, barcodeDisabled: true } }));
+console.log(JSON.stringify({ productionControlResolution: { set: resolvedWeld.set.name, processes: resolvedWeld.processes.length, wrongStationBlocked: true }, completed: { status: row.CurrentStatus, scans: Number(row.ScanCount), approvals: Number(row.ApprovalCount) }, independentRework: hold.recordset[0], archive: { hiddenFromActiveProjects: true, productionHistoryPreserved: Number(row.ScanCount) === 8, barcodeDisabled: true } }));
 await pool.close();

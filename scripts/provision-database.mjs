@@ -40,6 +40,7 @@ try {
   await runMigration(applicationDatabase, '002_project_route_columns.sql');
   await runMigration(applicationDatabase, '003_qc_rework_cases.sql');
   await runMigration(applicationDatabase, '004_assembly_project_profiles.sql');
+  await runMigration(applicationDatabase, '005_production_control_station_ownership.sql');
   const safePassword = password.replaceAll("'", "''");
   await applicationDatabase.request().batch(`
     IF SUSER_ID(N'${login}') IS NULL
