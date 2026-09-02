@@ -522,10 +522,13 @@ function DeleteProjectModal({ project, onClose, onDelete, onArchive }: { project
 function AssemblyProfileModal({ project, onClose, onSave, notify }: { project: Project; onClose: () => void; onSave: (profile: ProjectProfile) => void; notify: (message: string) => void }) {
   const emptyProfile: ProjectProfile = { mainDrawingNumber: '', componentDrawings: [], customFields: {}, importedHeaders: [], importedRows: [], sourceFileName: '', importedRowCount: 0 };
   const [profile, setProfile] = useState<ProjectProfile>(() => structuredClone(project.profile || emptyProfile));
+  const [section, setSection] = useState<'header' | 'parts' | 'import'>('header');
   const [reading, setReading] = useState(false);
   const addDrawing = () => setProfile((current) => ({ ...current, componentDrawings: [...current.componentDrawings, { id: uid(), drawingNumber: '', description: '' }] }));
   const updateDrawing = (id: string, patch: Partial<ProjectProfile['componentDrawings'][number]>) => setProfile((current) => ({ ...current, componentDrawings: current.componentDrawings.map((item) => item.id === id ? { ...item, ...patch } : item) }));
   const removeDrawing = (id: string) => setProfile((current) => ({ ...current, componentDrawings: current.componentDrawings.filter((item) => item.id !== id) }));
+  const field = (key: string) => profile.customFields[key] || '';
+  const updateField = (key: string, value: string) => setProfile((current) => ({ ...current, customFields: { ...current.customFields, [key]: value } }));
   const importExcel = async (file?: File) => {
     if (!file) return;
     setReading(true);
@@ -535,63 +538,84 @@ function AssemblyProfileModal({ project, onClose, onSave, notify }: { project: P
       if (sheet.length < 2) { notify('فایل Excel باید سربرگ و حداقل یک ردیف داده داشته باشد.'); return; }
       const headers = sheet[0].map((cell: unknown, index: number) => String(cell ?? '').trim() || `ستون ${index + 1}`);
       const rows: Record<string, string>[] = sheet.slice(1).filter((row: unknown[]) => row.some((cell: unknown) => cell !== null && String(cell).trim())).map((row: unknown[]) => Object.fromEntries(headers.map((header: string, index: number) => [header, String(row[index] ?? '').trim()])));
-      const drawingHeader = headers.find((header) => /شماره.*نقشه|نقشه|drawing|part\s*(no|number)/i.test(header));
-      const importedDrawings: ProjectProfile['componentDrawings'] = drawingHeader ? [...new Set(rows.map((row) => row[drawingHeader]).filter(Boolean))].map((drawingNumber: string) => ({ id: uid(), drawingNumber, description: '' })) : [];
+      const drawingHeader = headers.find((header) => /شماره.*نقشه|نقشه|drawing|part([_\s-]*(no|number|pos))?|قطعه/i.test(header));
+      const descriptionHeader = headers.find((header) => /شرح|نام.*قطعه|description|name|profile/i.test(header));
+      const importedDrawings: ProjectProfile['componentDrawings'] = drawingHeader ? [...new Map(rows.filter((row) => row[drawingHeader]).map((row) => [row[drawingHeader], { id: uid(), drawingNumber: row[drawingHeader], description: descriptionHeader ? row[descriptionHeader] : '' }])).values()] : [];
       setProfile((current) => ({ ...current, importedHeaders: headers, importedRows: rows, sourceFileName: file.name, importedRowCount: rows.length, componentDrawings: importedDrawings.length ? importedDrawings : current.componentDrawings }));
       notify(`${rows.length.toLocaleString('fa-IR')} ردیف از Excel خوانده شد.`);
     } catch { notify('فایل Excel خوانده نشد؛ ساختار فایل را بررسی کنید.'); }
     finally { setReading(false); }
   };
-  const detectedDrawingHeader = profile.importedHeaders.find((header) => /شماره.*نقشه|نقشه|drawing|part\s*(no|number)/i.test(header));
-  const completedParts = [Boolean(profile.mainDrawingNumber.trim()), profile.componentDrawings.some((item) => item.drawingNumber.trim()), profile.importedRows.length > 0].filter(Boolean).length;
+  const detectedDrawingHeader = profile.importedHeaders.find((header) => /شماره.*نقشه|نقشه|drawing|part([_\s-]*(no|number|pos))?|قطعه/i.test(header));
+  const titleBlockFields = ['client', 'orderNumber', 'drawingTitle', 'drawingDescription', 'scale', 'revision', 'drawnBy', 'designedBy', 'checkedBy', 'approvedBy'];
+  const completedHeaderFields = titleBlockFields.filter((key) => field(key).trim()).length + (profile.mainDrawingNumber.trim() ? 1 : 0);
+  const registeredParts = profile.componentDrawings.filter((item) => item.drawingNumber.trim()).length;
 
   return <div className="modal-layer">
     <button className="modal-scrim" type="button" onClick={onClose} />
-    <section className="forge-modal assembly-profile-modal">
-      <header><div><span>Assembly Part · {project.code}</span><h2>شناسنامه فنی {project.name}</h2></div><button type="button" onClick={onClose}><X size={19} /></button></header>
+    <section className="forge-modal assembly-profile-modal dossier-modal">
+      <header className="dossier-header">
+        <div className="dossier-project-mark"><span><Boxes size={24} /></span><div><small>ASSEMBLY TECHNICAL DOSSIER</small><h2>{project.name}</h2><p><b>{project.code}</b> · شناسنامه مهندسی و ساخت</p></div></div>
+        <div className="dossier-header-actions"><span className="dossier-state"><i /> در حال تدوین</span><button type="button" onClick={onClose}><X size={19} /></button></div>
+      </header>
 
-      <div className="profile-intro">
-        <span><FileSpreadsheet size={22} /></span>
-        <div><b>اطلاعات ساخت این پروژه را یک‌جا کامل کنید</b><small>نقشه مادر، قطعات تشکیل‌دهنده و فایل مبنای مهندسی در همین شناسنامه نگهداری می‌شوند.</small></div>
-        <em>{completedParts.toLocaleString('fa-IR')} از ۳ بخش تکمیل</em>
+      <div className="dossier-commandbar">
+        <div className="dossier-tabs">
+          <button className={section === 'header' ? 'active' : ''} type="button" onClick={() => setSection('header')}><span>۰۱</span><b>سربرگ نقشه</b><small>{completedHeaderFields.toLocaleString('fa-IR')} فیلد تکمیل</small></button>
+          <button className={section === 'parts' ? 'active' : ''} type="button" onClick={() => setSection('parts')}><span>۰۲</span><b>ساختار محصول</b><small>{registeredParts.toLocaleString('fa-IR')} قطعه ثبت‌شده</small></button>
+          <button className={section === 'import' ? 'active' : ''} type="button" onClick={() => setSection('import')}><span>۰۳</span><b>ورود از Excel</b><small>{profile.importedRows.length ? `${profile.importedRows.length.toLocaleString('fa-IR')} ردیف خوانده‌شده` : 'آماده دریافت فایل'}</small></button>
+        </div>
+        <div className="dossier-metrics"><span><small>نقشه مادر</small><b>{profile.mainDrawingNumber || 'ثبت نشده'}</b></span><span><small>وضعیت داده</small><b>{profile.sourceFileName ? 'Excel متصل' : 'ورود دستی'}</b></span></div>
       </div>
 
-      <div className="profile-journey" aria-label="مراحل تکمیل شناسنامه فنی">
-        <div className="done"><span>۱</span><b>پروژه</b><small>{project.code}</small></div>
-        <i />
-        <div className={profile.mainDrawingNumber.trim() ? 'done' : 'current'}><span>۲</span><b>نقشه مادر</b><small>{profile.mainDrawingNumber.trim() || 'در انتظار ثبت'}</small></div>
-        <i />
-        <div className={profile.componentDrawings.some((item) => item.drawingNumber.trim()) ? 'done' : 'current'}><span>۳</span><b>اجزای سازنده</b><small>{profile.componentDrawings.filter((item) => item.drawingNumber.trim()).length.toLocaleString('fa-IR')} نقشه</small></div>
-        <i />
-        <div className={profile.importedRows.length ? 'done' : ''}><span>۴</span><b>فایل Excel</b><small>{profile.importedRows.length ? `${profile.importedRows.length.toLocaleString('fa-IR')} ردیف` : 'اختیاری'}</small></div>
-      </div>
-
-      <div className="profile-grid">
-        <section className="profile-primary">
-          <div className="profile-section-title"><span>۰۱</span><div><b>نقشه مادر Assembly</b><small>شماره نقشه‌ای که کل پروژه مونتاژی را معرفی می‌کند.</small></div></div>
-          <label>شماره نقشه اصلی<input value={profile.mainDrawingNumber} onChange={(event) => setProfile({ ...profile, mainDrawingNumber: event.target.value.toUpperCase() })} placeholder="مثال: ASSY-WP-1001" /></label>
-          <div className="component-heading"><span><b>۰۲ · اجزای تشکیل‌دهنده</b><small>هر قطعه یا زیرمونتاژ را با شماره نقشه خودش ثبت کنید.</small></span><button type="button" onClick={addDrawing}><Plus size={14} /> افزودن قطعه</button></div>
-          <div className="component-drawings">
-            {profile.componentDrawings.map((drawing, index) => <div key={drawing.id}><span>{(index + 1).toLocaleString('fa-IR')}</span><input value={drawing.drawingNumber} onChange={(event) => updateDrawing(drawing.id, { drawingNumber: event.target.value.toUpperCase() })} placeholder="شماره نقشه قطعه" /><input value={drawing.description} onChange={(event) => updateDrawing(drawing.id, { description: event.target.value })} placeholder="نام یا شرح قطعه" /><button type="button" onClick={() => removeDrawing(drawing.id)} aria-label="حذف نقشه"><Trash2 size={14} /></button></div>)}
-            {!profile.componentDrawings.length && <div className="component-empty"><span>هنوز جزئی ثبت نشده است</span><small>از «افزودن قطعه» استفاده کنید یا فایل Excel را وارد کنید.</small></div>}
+      <main className="dossier-body">
+        {section === 'header' && <section className="dossier-panel titleblock-panel">
+          <header><div><span>TEKLA TITLE BLOCK</span><h3>اطلاعات سربرگ نقشه</h3><p>فیلدها مستقیماً از قالب TITEL ASSEMBLY واحد مهندسی استخراج شده‌اند.</p></div><em>{completedHeaderFields.toLocaleString('fa-IR')} / ۱۱</em></header>
+          <div className="titleblock-canvas">
+            <div className="titleblock-brand"><span>WPMES</span><div><b>{project.name}</b><small>Wagon Pars Manufacturing Execution System</small></div></div>
+            <div className="titleblock-fields primary-fields">
+              <label className="wide">عنوان نقشه / TITLE<input value={field('drawingTitle')} onChange={(event) => updateField('drawingTitle', event.target.value)} placeholder="عنوان کامل نقشه مونتاژی" /></label>
+              <label>شماره نقشه / DWG NO.<input value={profile.mainDrawingNumber} onChange={(event) => setProfile({ ...profile, mainDrawingNumber: event.target.value.toUpperCase() })} placeholder="ASSY-WP-1001" /></label>
+              <label>بازنگری / REV.<input value={field('revision')} onChange={(event) => updateField('revision', event.target.value.toUpperCase())} placeholder="00" /></label>
+              <label>مقیاس / SCALE<input value={field('scale')} onChange={(event) => updateField('scale', event.target.value)} placeholder="1:10" /></label>
+              <label className="wide">شرح / DESCRIPTION<input value={field('drawingDescription')} onChange={(event) => updateField('drawingDescription', event.target.value)} placeholder="شرح فنی نقشه یا مجموعه" /></label>
+            </div>
+            <div className="titleblock-fields project-fields">
+              <label>نام پروژه / PROJECT<input value={project.name} disabled /></label>
+              <label>شماره پروژه / PROJECT NO.<input value={project.code} disabled /></label>
+              <label>کارفرما / CLIENT<input value={field('client')} onChange={(event) => updateField('client', event.target.value)} placeholder="نام کارفرما" /></label>
+              <label>شماره سفارش / ORDER NO.<input value={field('orderNumber')} onChange={(event) => updateField('orderNumber', event.target.value.toUpperCase())} placeholder="شماره قرارداد یا سفارش" /></label>
+              <label>سازنده / BUILDER<input value={field('builder')} onChange={(event) => updateField('builder', event.target.value)} placeholder="نام سازنده" /></label>
+              <label>طراح / DESIGNER<input value={field('designer')} onChange={(event) => updateField('designer', event.target.value)} placeholder="شرکت یا واحد طراح" /></label>
+              <label className="wide">آدرس پروژه / PROJECT ADDRESS<input value={field('projectAddress')} onChange={(event) => updateField('projectAddress', event.target.value)} placeholder="محل اجرای پروژه" /></label>
+            </div>
+            <div className="approval-strip">
+              {[['drawnBy', 'ترسیم / DRAWN'], ['designedBy', 'طراحی / DESIGNED'], ['checkedBy', 'کنترل / CHECKED'], ['approvedBy', 'تأیید / APPROVED']].map(([key, label]) => <label key={key}><span>{label}</span><input value={field(key)} onChange={(event) => updateField(key, event.target.value)} placeholder="نام و نام خانوادگی" /><input type="date" value={field(`${key}Date`)} onChange={(event) => updateField(`${key}Date`, event.target.value)} /></label>)}
+            </div>
           </div>
-        </section>
+        </section>}
 
-        <aside className="excel-import-panel">
-          <div className="profile-section-title compact"><span>۰۳</span><div><b>ورود گروهی از Excel</b><small>برای پروژه‌هایی با تعداد قطعه زیاد</small></div></div>
-          <div className="excel-icon"><FileSpreadsheet size={28} /></div>
-          <h3>فایل BOM یا لیست نقشه‌ها</h3>
-          <div className="excel-guidelines"><span>ردیف اول: نام ستون‌ها</span><span>هر ردیف: یک قطعه یا زیرمونتاژ</span><span>ستون پیشنهادی: «شماره نقشه»</span></div>
-          <label className="excel-picker"><input type="file" accept=".xlsx,.xls" onChange={(event) => void importExcel(event.target.files?.[0])} /><FilePlus2 size={17} /> {reading ? 'در حال خواندن فایل…' : profile.sourceFileName ? 'جایگزینی فایل Excel' : 'انتخاب فایل Excel'}</label>
-          {profile.sourceFileName && <div className="import-summary"><CircleCheck size={17} /><span><b>{profile.sourceFileName}</b><small>{profile.importedRows.length.toLocaleString('fa-IR')} ردیف · {profile.importedHeaders.length.toLocaleString('fa-IR')} ستون</small></span></div>}
-          {profile.sourceFileName && <div className={`detected-column ${detectedDrawingHeader ? 'ok' : 'warning'}`}><b>{detectedDrawingHeader ? `ستون نقشه شناسایی شد: ${detectedDrawingHeader}` : 'ستون شماره نقشه شناسایی نشد'}</b><small>{detectedDrawingHeader ? 'نقشه‌های یکتا به اجزای سازنده اضافه شدند.' : 'اطلاعات فایل حفظ می‌شود؛ نام ستون را به «شماره نقشه» تغییر دهید.'}</small></div>}
-        </aside>
-      </div>
+        {section === 'parts' && <section className="dossier-panel parts-panel">
+          <header><div><span>PRODUCT STRUCTURE</span><h3>اجزای تشکیل‌دهنده Assembly</h3><p>هر ردیف، یک قطعه یا زیرمونتاژ با شماره نقشه مستقل است.</p></div><button type="button" onClick={addDrawing}><Plus size={15} /> افزودن قطعه</button></header>
+          <div className="parts-table-head"><span>ردیف</span><span>شماره نقشه / PART NO.</span><span>نام یا شرح قطعه</span><span>عملیات</span></div>
+          <div className="dossier-parts-list">
+            {profile.componentDrawings.map((drawing, index) => <article key={drawing.id}><span>{(index + 1).toLocaleString('fa-IR')}</span><input value={drawing.drawingNumber} onChange={(event) => updateDrawing(drawing.id, { drawingNumber: event.target.value.toUpperCase() })} placeholder="شماره نقشه قطعه" /><input value={drawing.description} onChange={(event) => updateDrawing(drawing.id, { description: event.target.value })} placeholder="نام، Profile یا شرح فنی" /><button type="button" onClick={() => removeDrawing(drawing.id)} aria-label="حذف قطعه"><Trash2 size={15} /></button></article>)}
+            {!profile.componentDrawings.length && <div className="dossier-empty"><Layers3 size={34} /><b>ساختار محصول هنوز ثبت نشده است</b><p>قطعات را دستی اضافه کنید یا از بخش «ورود از Excel» فایل BOM را بخوانید.</p><button type="button" onClick={() => setSection('import')}><FileSpreadsheet size={15} /> ورود فایل Excel</button></div>}
+          </div>
+        </section>}
 
-      {profile.importedRows.length > 0 && <section className="excel-preview"><header><div><b>کنترل داده قبل از ذخیره</b><small>نمونه‌ای از اطلاعات خوانده‌شده از فایل</small></div><span>{profile.importedRows.length.toLocaleString('fa-IR')} ردیف آماده ذخیره</span></header><div><table><thead><tr>{profile.importedHeaders.slice(0, 6).map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{profile.importedRows.slice(0, 4).map((row, index) => <tr key={index}>{profile.importedHeaders.slice(0, 6).map((header) => <td key={header}>{row[header] || '—'}</td>)}</tr>)}</tbody></table></div></section>}
+        {section === 'import' && <section className="dossier-panel import-panel">
+          <header><div><span>EXCEL DATA INTAKE</span><h3>ورود BOM و لیست نقشه‌ها</h3><p>تمام ستون‌های فایل حفظ می‌شوند و ستون شماره نقشه برای ساخت لیست قطعات تشخیص داده می‌شود.</p></div>{profile.sourceFileName && <em>{profile.sourceFileName}</em>}</header>
+          <div className="import-workspace">
+            <label className={`excel-dropzone ${reading ? 'reading' : ''}`}><input type="file" accept=".xlsx,.xls" onChange={(event) => void importExcel(event.target.files?.[0])} /><span><FilePlus2 size={32} /></span><b>{reading ? 'در حال تحلیل فایل…' : profile.sourceFileName ? 'جایگزینی فایل Excel' : 'انتخاب فایل Excel'}</b><p>فرمت مجاز XLSX یا XLS · ردیف اول باید نام ستون‌ها باشد</p></label>
+            <aside className="tekla-map-card"><span>الگوی شناسایی‌شده از گزارش Tekla</span><div>{['Assembly', 'Part / Drawing No.', 'No. / Qty', 'Profile', 'Grade', 'Length (mm)', 'Weight (kg)'].map((item) => <b key={item}><i />{item}</b>)}</div><small>نام ستون‌ها می‌تواند فارسی یا انگلیسی باشد؛ داده خام بدون حذف نگهداری می‌شود.</small></aside>
+          </div>
+          {profile.sourceFileName && <div className="import-result-bar"><CircleCheck size={18} /><div><b>{profile.importedRows.length.toLocaleString('fa-IR')} ردیف و {profile.importedHeaders.length.toLocaleString('fa-IR')} ستون آماده است</b><small>{detectedDrawingHeader ? `ستون شماره نقشه: ${detectedDrawingHeader}` : 'ستون شماره نقشه تشخیص داده نشد؛ نام ستون را بررسی کنید.'}</small></div><button type="button" onClick={() => setSection('parts')}>مشاهده ساختار محصول <ChevronLeft size={14} /></button></div>}
+          {profile.importedRows.length > 0 && <section className="dossier-data-preview"><header><b>پیش‌نمایش اطلاعات</b><span>نمایش ۵ ردیف اول از {profile.importedRows.length.toLocaleString('fa-IR')}</span></header><div><table><thead><tr>{profile.importedHeaders.slice(0, 8).map((header) => <th key={header}>{header}</th>)}</tr></thead><tbody>{profile.importedRows.slice(0, 5).map((row, index) => <tr key={index}>{profile.importedHeaders.slice(0, 8).map((header) => <td key={header}>{row[header] || '—'}</td>)}</tr>)}</tbody></table></div></section>}
+        </section>}
+      </main>
 
-      <div className="profile-report-placeholder"><span>سربرگ تخصصی واحد</span><p>فیلدهای گزارش فردا بدون تغییر در اطلاعات فعلی، به همین شناسنامه اضافه می‌شوند.</p></div>
-      <footer><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" onClick={() => onSave({ ...profile, componentDrawings: profile.componentDrawings.filter((item) => item.drawingNumber.trim()), importedRowCount: profile.importedRows.length })}><Save size={15} /> ذخیره شناسنامه فنی</button></footer>
+      <footer className="dossier-footer"><div><ShieldCheck size={17} /><span><b>ذخیره یکپارچه شناسنامه</b><small>سربرگ، ساختار محصول و داده Excel با سوابق پروژه نگهداری می‌شوند.</small></span></div><div><button type="button" onClick={onClose}>انصراف</button><button className="primary" type="button" onClick={() => onSave({ ...profile, componentDrawings: profile.componentDrawings.filter((item) => item.drawingNumber.trim()), importedRowCount: profile.importedRows.length })}><Save size={15} /> ذخیره شناسنامه فنی</button></div></footer>
     </section>
   </div>;
 }

@@ -244,9 +244,11 @@ function normalizeProjectProfile(input) {
   })).filter((item) => item.drawingNumber);
   const importedHeaders = input.importedHeaders.map((value) => String(value || '').trim().slice(0, 120)).filter(Boolean);
   const importedRows = input.importedRows.map((row) => Object.fromEntries(importedHeaders.map((header) => [header, String(row?.[header] ?? '').slice(0, 1000)])));
+  const customSource = input.customFields && typeof input.customFields === 'object' && !Array.isArray(input.customFields) ? input.customFields : {};
+  const customFields = Object.fromEntries(Object.entries(customSource).slice(0, 60).map(([key, value]) => [String(key).trim().slice(0, 80), String(value ?? '').trim().slice(0, 500)]).filter(([key]) => key));
   return {
     mainDrawingNumber: String(input.mainDrawingNumber || '').trim().slice(0, 100), componentDrawings,
-    customFields: input.customFields && typeof input.customFields === 'object' && !Array.isArray(input.customFields) ? input.customFields : {},
+    customFields,
     importedHeaders, importedRows, sourceFileName: String(input.sourceFileName || '').trim().slice(0, 260),
   };
 }
