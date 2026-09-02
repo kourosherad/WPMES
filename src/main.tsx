@@ -4,6 +4,7 @@ import AppV3 from './AppV3';
 import './flagship.css';
 import './light-industrial.css';
 import './internal-premium.css';
+import './flagship-v2.css';
 
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
