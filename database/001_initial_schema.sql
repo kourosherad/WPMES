@@ -362,6 +362,7 @@ FROM (VALUES
     ('QUALITY_CONTROL', N'مسئول کنترل کیفیت', 'QUALITY_CONTROL'),
     ('PRODUCTION_CONTROL', N'مسئول کنترل تولید', 'PRODUCTION_CONTROL'),
     ('PACKAGING', N'مسئول پکیجینگ', 'PACKAGING'),
+    ('PLANNING', N'کارشناس برنامه‌ریزی', 'VIEWER'),
     ('ENGINEERING', N'کارشناس مهندسی', 'ENGINEERING'),
     ('SYSTEM_ADMIN', N'مدیر سامانه', 'ADMIN')
 ) AS Seed(Code, Title, RoleType)

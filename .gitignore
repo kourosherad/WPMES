@@ -7,5 +7,8 @@ secrets/
 tools/
 *.tsbuildinfo
 *.log
+*.bak
+*.mdf
+*.ldf
 .env
 .env.*

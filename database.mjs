@@ -8,6 +8,26 @@ const appRoot = fileURLToPath(new URL('.', import.meta.url));
 const configPath = process.env.WPMES_DB_CONFIG || join(appRoot, 'secrets', 'database.json');
 let poolPromise;
 
+function barcodeSegment(value, maxLength) {
+  return String(value || '').normalize('NFKC').trim().replace(/[|\r\n]+/g, '-').replace(/\s+/g, '_').slice(0, maxLength).toUpperCase();
+}
+
+function productionBarcode(projectName, projectCode, drawingNumber, unitNumber, totalQuantity) {
+  const width = Math.max(2, String(totalQuantity).length);
+  return `WPMES|${barcodeSegment(projectName, 38)}(${barcodeSegment(projectCode, 20)})|${barcodeSegment(drawingNumber, 52)}|${String(unitNumber).padStart(width, '0')}/${String(totalQuantity).padStart(width, '0')}`;
+}
+
+async function enqueueEvent(request, eventType, aggregateType, aggregateId, payload) {
+  await request
+    .input('outboxEventType', sql.NVarChar(160), eventType)
+    .input('outboxAggregateType', sql.NVarChar(100), aggregateType)
+    .input('outboxAggregateId', sql.NVarChar(100), String(aggregateId))
+    .input('outboxPayload', sql.NVarChar(sql.MAX), JSON.stringify(payload))
+    .query(`DECLARE @SequenceNumber BIGINT = (SELECT ISNULL(MAX(SequenceNumber),0)+1 FROM ops.OutboxEvents WITH (UPDLOCK,HOLDLOCK));
+      INSERT INTO ops.OutboxEvents (EventType,AggregateType,AggregateId,PayloadJson,SequenceNumber)
+      VALUES (@outboxEventType,@outboxAggregateType,@outboxAggregateId,@outboxPayload,@SequenceNumber);`);
+}
+
 export function databaseConfigured() {
   return existsSync(configPath);
 }
@@ -52,8 +72,8 @@ export async function databaseHealth() {
 }
 
 const roleCodes = {
-  operator: 'PRODUCTION_CONTROL', qc: 'QUALITY_CONTROL', production: 'PRODUCTION_CONTROL',
-  packaging: 'PACKAGING', engineering: 'ENGINEERING', admin: 'SYSTEM_ADMIN',
+  operator: 'OPERATOR', qc: 'QUALITY_CONTROL', production: 'PRODUCTION_CONTROL',
+  packaging: 'PACKAGING', planning: 'PLANNING', engineering: 'ENGINEERING', admin: 'SYSTEM_ADMIN',
 };
 
 async function ensureIdentity(request, user) {
@@ -85,6 +105,14 @@ function assembleProjects(result) {
     let details = {};
     try { details = JSON.parse(row.ProfileJson || '{}'); } catch { details = {}; }
     return [String(row.ProjectId).toLowerCase(), {
+      baseCompleted: details.baseCompleted === true,
+      clientName: details.clientName || '',
+      orderNumber: details.orderNumber || '',
+      itemType: details.itemType === 'single' ? 'single' : details.itemType === 'assembly' ? 'assembly' : null,
+      plannedQuantity: Number(details.plannedQuantity || 0),
+      dimension: details.dimension || '',
+      weight: details.weight || '',
+      description: details.description || '',
       mainDrawingNumber: row.MainDrawingNumber || '',
       componentDrawings: Array.isArray(details.componentDrawings) ? details.componentDrawings : [],
       customFields: details.customFields && typeof details.customFields === 'object' ? details.customFields : {},
@@ -127,7 +155,8 @@ function assembleProjects(result) {
     const key = String(row.Id).toLowerCase();
     return {
       id: String(row.Id), name: row.ProjectName, code: row.ProjectCode,
-      itemType: row.ItemType === 'SINGLE' ? 'single' : 'assembly',
+      itemType: row.ItemType === 'SINGLE' ? 'single' : row.ItemType === 'ASSEMBLY' ? 'assembly' : null,
+      status: row.Status,
       drawings: drawings.get(key) || [], sets: sets.get(key) || [],
       profile: profiles.get(key) || null,
       createdAt: row.CreatedAtUtc, updatedAt: row.UpdatedAtUtc,
@@ -139,7 +168,7 @@ export async function listProjects(projectId = null, includeArchived = false) {
   const pool = await databasePool();
   const request = pool.request().input('projectId', sql.UniqueIdentifier, projectId).input('includeArchived', sql.Bit, includeArchived);
   const result = await request.query(`
-    SELECT Id, ProjectCode, ProjectName, ItemType, CreatedAtUtc, UpdatedAtUtc
+    SELECT Id, ProjectCode, ProjectName, ItemType, Status, CreatedAtUtc, UpdatedAtUtc
       FROM core.Projects WHERE (@projectId IS NULL OR Id = @projectId) AND (@includeArchived=1 OR Status<>'CANCELLED') ORDER BY CreatedAtUtc;
     SELECT ProjectId, DrawingNumber FROM core.Drawings
       WHERE (@projectId IS NULL OR ProjectId = @projectId) AND ProjectId IN (SELECT Id FROM core.Projects WHERE @includeArchived=1 OR Status<>'CANCELLED') ORDER BY CreatedAtUtc;
@@ -196,17 +225,9 @@ export async function createProject(input, actor) {
       .input('id', sql.UniqueIdentifier, projectId)
       .input('code', sql.NVarChar(60), input.code.trim())
       .input('name', sql.NVarChar(220), input.name.trim())
-      .input('itemType', sql.VarChar(20), input.itemType === 'single' ? 'SINGLE' : 'ASSEMBLY')
       .input('userId', sql.UniqueIdentifier, identity.UserId)
       .query(`INSERT INTO core.Projects (Id, ProjectCode, ProjectName, ItemType, CreatedByUserId)
-              VALUES (@id, @code, @name, @itemType, @userId);`);
-    for (const drawing of input.drawings) {
-      await new sql.Request(transaction)
-        .input('projectId', sql.UniqueIdentifier, projectId)
-        .input('drawing', sql.NVarChar(100), drawing)
-        .query(`INSERT INTO core.Drawings (ProjectId, DrawingNumber, RevisionCode)
-                VALUES (@projectId, @drawing, N'REV-0');`);
-    }
+              VALUES (@id, @code, @name, NULL, @userId);`);
     await new sql.Request(transaction)
       .input('userId', sql.UniqueIdentifier, identity.UserId)
       .input('roleId', sql.UniqueIdentifier, identity.RoleId)
@@ -223,6 +244,42 @@ export async function createProject(input, actor) {
   }
 }
 
+export async function saveProjectBaseProfile(projectId, base, actor) {
+  const pool = await databasePool();
+  const transaction = new sql.Transaction(pool);
+  await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
+  try {
+    const identity = await ensureIdentity(new sql.Request(transaction), actor);
+    const current = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).query(`
+      SELECT Projects.Status,Profiles.ProfileJson FROM core.Projects Projects WITH (UPDLOCK,HOLDLOCK)
+      LEFT JOIN core.ProjectProfiles Profiles ON Profiles.ProjectId=Projects.Id WHERE Projects.Id=@projectId;`);
+    if (!current.recordset.length) { const error = new Error('PROJECT_NOT_FOUND'); error.statusCode = 404; throw error; }
+    if (current.recordset[0].Status !== 'DRAFT') { const error = new Error('BASE_PROFILE_LOCKED'); error.statusCode = 409; throw error; }
+    let details = {};
+    try { details = JSON.parse(current.recordset[0].ProfileJson || '{}'); } catch { details = {}; }
+    details = { ...details, baseCompleted: true, clientName: base.clientName, orderNumber: base.orderNumber };
+    await new sql.Request(transaction)
+      .input('projectId', sql.UniqueIdentifier, projectId).input('name', sql.NVarChar(220), base.name)
+      .input('code', sql.NVarChar(60), base.code).input('json', sql.NVarChar(sql.MAX), JSON.stringify(details))
+      .input('userId', sql.UniqueIdentifier, identity.UserId)
+      .query(`UPDATE core.Projects SET ProjectName=@name,ProjectCode=@code,UpdatedAtUtc=SYSUTCDATETIME() WHERE Id=@projectId;
+        MERGE core.ProjectProfiles AS Target USING (SELECT @projectId AS ProjectId) AS Source ON Target.ProjectId=Source.ProjectId
+        WHEN MATCHED THEN UPDATE SET ProfileJson=@json,UpdatedByUserId=@userId,UpdatedAtUtc=SYSUTCDATETIME()
+        WHEN NOT MATCHED THEN INSERT (ProjectId,ProfileJson,UpdatedByUserId) VALUES (@projectId,@json,@userId);`);
+    await new sql.Request(transaction)
+      .input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
+      .input('correlationId', sql.UniqueIdentifier, randomUUID()).input('entityId', sql.NVarChar(100), projectId)
+      .input('after', sql.NVarChar(sql.MAX), JSON.stringify(base))
+      .query(`INSERT INTO ops.AuditLogs (ActorUserId,ActorRoleId,EventType,EntityType,EntityId,CorrelationId,AfterJson)
+        VALUES (@userId,@roleId,'PROJECT_BASE_PROFILE_COMPLETED','PROJECT_PROFILE',@entityId,@correlationId,@after);`);
+    await transaction.commit();
+    return (await listProjects(projectId))[0];
+  } catch (error) {
+    await transaction.rollback().catch(() => {});
+    throw error;
+  }
+}
+
 export async function saveProjectProfile(projectId, profile, actor) {
   const pool = await databasePool();
   const transaction = new sql.Transaction(pool);
@@ -230,10 +287,26 @@ export async function saveProjectProfile(projectId, profile, actor) {
   try {
     const identity = await ensureIdentity(new sql.Request(transaction), actor);
     const project = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
-      .query(`SELECT ItemType FROM core.Projects WITH (UPDLOCK, HOLDLOCK) WHERE Id=@projectId;`);
+      .query(`SELECT Projects.ProjectCode,Projects.ProjectName,Projects.ItemType,Projects.Status,Profiles.ProfileJson
+        FROM core.Projects Projects WITH (UPDLOCK,HOLDLOCK)
+        LEFT JOIN core.ProjectProfiles Profiles ON Profiles.ProjectId=Projects.Id WHERE Projects.Id=@projectId;`);
     if (!project.recordset.length) { const error = new Error('PROJECT_NOT_FOUND'); error.statusCode = 404; throw error; }
-    if (project.recordset[0].ItemType !== 'ASSEMBLY') { const error = new Error('PROFILE_ASSEMBLY_ONLY'); error.statusCode = 409; throw error; }
+    let existingDetails = {};
+    try { existingDetails = JSON.parse(project.recordset[0].ProfileJson || '{}'); } catch { existingDetails = {}; }
+    if (existingDetails.baseCompleted !== true) { const error = new Error('BASE_PROFILE_REQUIRED'); error.statusCode = 409; throw error; }
+    if (project.recordset[0].Status !== 'DRAFT' && project.recordset[0].ItemType !== (profile.itemType === 'single' ? 'SINGLE' : 'ASSEMBLY')) {
+      const error = new Error('PRODUCT_TYPE_LOCKED'); error.statusCode = 409; throw error;
+    }
+    if (!['single', 'assembly'].includes(profile.itemType) || !profile.mainDrawingNumber || !Number.isInteger(profile.plannedQuantity) || profile.plannedQuantity < 1 || profile.plannedQuantity > 10000) {
+      const error = new Error('PROFILE_RELEASE_FIELDS_REQUIRED'); error.statusCode = 422; throw error;
+    }
     const details = {
+      ...existingDetails,
+      itemType: profile.itemType,
+      plannedQuantity: profile.plannedQuantity,
+      dimension: profile.dimension || '',
+      weight: profile.weight || '',
+      description: profile.description || '',
       componentDrawings: profile.componentDrawings,
       customFields: profile.customFields || {},
       importedHeaders: profile.importedHeaders || [],
@@ -252,12 +325,71 @@ export async function saveProjectProfile(projectId, profile, actor) {
           ImportedRowCount=@rowCount, UpdatedByUserId=@userId, UpdatedAtUtc=SYSUTCDATETIME()
         WHEN NOT MATCHED THEN INSERT (ProjectId,MainDrawingNumber,ProfileJson,SourceFileName,ImportedRowCount,UpdatedByUserId)
           VALUES (@projectId,@mainDrawing,@json,@fileName,@rowCount,@userId);`);
+    await new sql.Request(transaction)
+      .input('projectId', sql.UniqueIdentifier, projectId)
+      .input('itemType', sql.VarChar(20), profile.itemType === 'single' ? 'SINGLE' : 'ASSEMBLY')
+      .query(`UPDATE core.Projects SET ItemType=@itemType, UpdatedAtUtc=SYSUTCDATETIME() WHERE Id=@projectId;`);
     await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
       .query('DELETE FROM core.Drawings WHERE ProjectId=@projectId;');
     const drawings = [...new Set([profile.mainDrawingNumber, ...profile.componentDrawings.map((item) => item.drawingNumber)].map((value) => String(value || '').trim()).filter(Boolean))];
     for (const drawing of drawings) {
       await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).input('drawing', sql.NVarChar(100), drawing)
         .query(`INSERT INTO core.Drawings (ProjectId,DrawingNumber,RevisionCode) VALUES (@projectId,@drawing,N'REV-0');`);
+    }
+    const workItemState = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).query(`
+      SELECT WorkItems.Id,WorkItems.UnitNumber,WorkItems.CurrentStatus,
+        CASE WHEN EXISTS (SELECT 1 FROM production.ScanEvents Events WHERE Events.WorkItemId=WorkItems.Id) THEN 1 ELSE 0 END AS HasScans
+      FROM production.WorkItems WorkItems WITH (UPDLOCK,HOLDLOCK)
+      WHERE WorkItems.ProjectId=@projectId ORDER BY WorkItems.UnitNumber;`);
+    const existingQuantity = workItemState.recordset.length;
+    if (existingQuantity && profile.plannedQuantity < existingQuantity) {
+      const blocked = workItemState.recordset.some((item) => Number(item.UnitNumber) > profile.plannedQuantity && (item.CurrentStatus !== 'READY' || item.HasScans));
+      if (blocked) { const error = new Error('QUANTITY_REDUCTION_STARTED'); error.statusCode = 409; throw error; }
+      await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).input('quantity', sql.Int, profile.plannedQuantity).query(`
+        DELETE Executions FROM production.StepExecutions Executions JOIN production.WorkItems WorkItems ON WorkItems.Id=Executions.WorkItemId WHERE WorkItems.ProjectId=@projectId AND WorkItems.UnitNumber>@quantity;
+        DELETE Barcodes FROM production.Barcodes Barcodes JOIN production.WorkItems WorkItems ON WorkItems.Id=Barcodes.WorkItemId WHERE WorkItems.ProjectId=@projectId AND WorkItems.UnitNumber>@quantity;
+        DELETE FROM production.WorkItems WHERE ProjectId=@projectId AND UnitNumber>@quantity;`);
+    }
+    if (existingQuantity && profile.plannedQuantity > existingQuantity) {
+      const firstRoute = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).query(`
+        SELECT TOP (1) Items.Id AS ItemDefinitionId,Routes.Id AS RouteDefinitionId,Steps.Id AS FirstStepId
+        FROM engineering.ItemDefinitions Items JOIN engineering.RouteDefinitions Routes ON Routes.ItemDefinitionId=Items.Id
+        JOIN engineering.RouteSteps Steps ON Steps.RouteDefinitionId=Routes.Id AND Steps.StepOrder=1
+        WHERE Items.ProjectId=@projectId ORDER BY Items.SetOrder;`);
+      const target = firstRoute.recordset[0];
+      if (!target) { const error = new Error('SET_ROUTE_NOT_FOUND'); error.statusCode = 409; throw error; }
+      for (let unitNumber = existingQuantity + 1; unitNumber <= profile.plannedQuantity; unitNumber += 1) {
+        const workItemId = randomUUID();
+        const serialNumber = `${project.recordset[0].ProjectCode}-${String(unitNumber).padStart(Math.max(2, String(profile.plannedQuantity).length), '0')}`;
+        await new sql.Request(transaction)
+          .input('id', sql.UniqueIdentifier, workItemId).input('projectId', sql.UniqueIdentifier, projectId)
+          .input('itemId', sql.UniqueIdentifier, target.ItemDefinitionId).input('routeId', sql.UniqueIdentifier, target.RouteDefinitionId)
+          .input('serial', sql.NVarChar(100), serialNumber).input('stepId', sql.UniqueIdentifier, target.FirstStepId)
+          .input('unitNumber', sql.Int, unitNumber).input('batchQuantity', sql.Int, profile.plannedQuantity)
+          .query(`INSERT INTO production.WorkItems (Id,ProjectId,ItemDefinitionId,RouteDefinitionId,SerialNumber,CurrentRouteStepId,CurrentStatus,UnitNumber,BatchQuantity)
+            VALUES (@id,@projectId,@itemId,@routeId,@serial,@stepId,'READY',@unitNumber,@batchQuantity);`);
+        await new sql.Request(transaction).input('id', sql.UniqueIdentifier, randomUUID()).input('workItemId', sql.UniqueIdentifier, workItemId)
+          .input('barcode', sql.NVarChar(160), productionBarcode(project.recordset[0].ProjectName, project.recordset[0].ProjectCode, profile.mainDrawingNumber, unitNumber, profile.plannedQuantity))
+          .input('userId', sql.UniqueIdentifier, identity.UserId)
+          .query(`INSERT INTO production.Barcodes (Id,WorkItemId,BarcodeValue,IssuedByUserId) VALUES (@id,@workItemId,@barcode,@userId);`);
+        await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, workItemId).input('stepId', sql.UniqueIdentifier, target.FirstStepId)
+          .query(`INSERT INTO production.StepExecutions (WorkItemId,RouteStepId,Status) VALUES (@workItemId,@stepId,'READY');`);
+      }
+    }
+    if (existingQuantity) {
+      await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).input('quantity', sql.Int, profile.plannedQuantity)
+        .query(`UPDATE production.WorkItems SET BatchQuantity=@quantity WHERE ProjectId=@projectId;
+          UPDATE engineering.ItemDefinitions SET PlannedQuantity=@quantity WHERE ProjectId=@projectId;`);
+      const activeItems = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).query(`
+        SELECT WorkItems.Id,WorkItems.UnitNumber FROM production.WorkItems WorkItems WHERE WorkItems.ProjectId=@projectId ORDER BY WorkItems.UnitNumber;`);
+      for (const item of activeItems.recordset) {
+        await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, item.Id)
+          .input('barcode', sql.NVarChar(160), productionBarcode(project.recordset[0].ProjectName, project.recordset[0].ProjectCode, profile.mainDrawingNumber, Number(item.UnitNumber), profile.plannedQuantity))
+          .query("UPDATE production.Barcodes SET BarcodeValue=@barcode WHERE WorkItemId=@workItemId AND Status='ACTIVE';");
+      }
+      if (profile.plannedQuantity !== existingQuantity) await enqueueEvent(new sql.Request(transaction), 'PROJECT_QUANTITY_CHANGED', 'PROJECT', projectId, {
+        projectId, previousQuantity: existingQuantity, quantity: profile.plannedQuantity, labelsMustBeRegenerated: true,
+      });
     }
     await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
       .query('UPDATE core.Projects SET UpdatedAtUtc=SYSUTCDATETIME() WHERE Id=@projectId;');
@@ -314,7 +446,7 @@ export async function deleteProject(projectId, actor) {
   }
 }
 
-export async function replaceProjectRoute(projectId, projectSets, actor) {
+export async function replaceProjectRoute(projectId, projectSets, actor, releaseToProduction = true) {
   const pool = await databasePool();
   const transaction = new sql.Transaction(pool);
   await transaction.begin(sql.ISOLATION_LEVEL.SERIALIZABLE);
@@ -325,9 +457,23 @@ export async function replaceProjectRoute(projectId, projectSets, actor) {
     if (Number(guard.recordset[0].WorkItemCount) > 0) {
       const error = new Error('ROUTE_ALREADY_IN_USE'); error.statusCode = 409; throw error;
     }
+    if (!projectSets.length || projectSets.some((set) => !set.steps?.length)) {
+      const error = new Error('ROUTE_REQUIRES_STEPS'); error.statusCode = 422; throw error;
+    }
     const request = new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId);
-    const exists = await request.query('SELECT Id FROM core.Projects WITH (UPDLOCK, HOLDLOCK) WHERE Id = @projectId;');
+    const exists = await request.query(`SELECT Projects.Id,Projects.ProjectCode,Projects.ProjectName,Projects.ItemType,
+        Profiles.MainDrawingNumber,Profiles.ProfileJson
+      FROM core.Projects Projects WITH (UPDLOCK,HOLDLOCK)
+      LEFT JOIN core.ProjectProfiles Profiles ON Profiles.ProjectId=Projects.Id
+      WHERE Projects.Id=@projectId;`);
     if (!exists.recordset.length) { const error = new Error('PROJECT_NOT_FOUND'); error.statusCode = 404; throw error; }
+    const projectRow = exists.recordset[0];
+    let profileDetails = {};
+    try { profileDetails = JSON.parse(projectRow.ProfileJson || '{}'); } catch { profileDetails = {}; }
+    const plannedQuantity = releaseToProduction ? Number(profileDetails.plannedQuantity || 0) : 1;
+    if (releaseToProduction && (!projectRow.ItemType || !projectRow.MainDrawingNumber || !Number.isInteger(plannedQuantity) || plannedQuantity < 1 || plannedQuantity > 10000)) {
+      const error = new Error('PROFILE_RELEASE_FIELDS_REQUIRED'); error.statusCode = 422; throw error;
+    }
     await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).query(`
       DELETE Steps FROM engineering.RouteSteps Steps
         JOIN engineering.RouteDefinitions Routes ON Routes.Id = Steps.RouteDefinitionId
@@ -343,10 +489,10 @@ export async function replaceProjectRoute(projectId, projectSets, actor) {
       await new sql.Request(transaction)
         .input('id', sql.UniqueIdentifier, setId).input('projectId', sql.UniqueIdentifier, projectId)
         .input('code', sql.NVarChar(80), setCode).input('name', sql.NVarChar(220), set.name)
-        .input('type', sql.VarChar(20), set.kind === 'single' ? 'SINGLE' : 'ASSEMBLY')
-        .input('order', sql.Int, setIndex + 1).input('role', sql.NVarChar(120), set.operatorRole)
+        .input('type', sql.VarChar(20), releaseToProduction && projectRow.ItemType ? projectRow.ItemType : set.kind === 'single' ? 'SINGLE' : 'ASSEMBLY')
+        .input('order', sql.Int, setIndex + 1).input('role', sql.NVarChar(120), set.operatorRole).input('plannedQuantity', sql.Int, plannedQuantity)
         .query(`INSERT INTO engineering.ItemDefinitions (Id, ProjectId, ItemCode, ItemName, ItemType, PlannedQuantity, SetOrder, OperatorRoleKey)
-                VALUES (@id, @projectId, @code, @name, @type, 1, @order, @role);`);
+                VALUES (@id, @projectId, @code, @name, @type, @plannedQuantity, @order, @role);`);
       const routeId = randomUUID();
       await new sql.Request(transaction)
         .input('id', sql.UniqueIdentifier, routeId).input('setId', sql.UniqueIdentifier, setId)
@@ -368,8 +514,42 @@ export async function replaceProjectRoute(projectId, projectSets, actor) {
             VALUES (@id, @routeId, @order, @code, @name, @execution, @station, @contractor, @qc, @production, @barcode);`);
       }
     }
+    if (releaseToProduction) {
+      const firstRoute = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId).query(`
+      SELECT TOP (1) Items.Id AS ItemDefinitionId,Routes.Id AS RouteDefinitionId,Steps.Id AS FirstStepId
+      FROM engineering.ItemDefinitions Items
+      JOIN engineering.RouteDefinitions Routes ON Routes.ItemDefinitionId=Items.Id
+      JOIN engineering.RouteSteps Steps ON Steps.RouteDefinitionId=Routes.Id AND Steps.StepOrder=1
+      WHERE Items.ProjectId=@projectId ORDER BY Items.SetOrder;`);
+      const target = firstRoute.recordset[0];
+      for (let unitNumber = 1; unitNumber <= plannedQuantity; unitNumber += 1) {
+      const workItemId = randomUUID();
+      const serialNumber = `${projectRow.ProjectCode}-${String(unitNumber).padStart(Math.max(2, String(plannedQuantity).length), '0')}`;
+      const barcode = productionBarcode(projectRow.ProjectName, projectRow.ProjectCode, projectRow.MainDrawingNumber, unitNumber, plannedQuantity);
+      await new sql.Request(transaction)
+        .input('id', sql.UniqueIdentifier, workItemId).input('projectId', sql.UniqueIdentifier, projectId)
+        .input('itemId', sql.UniqueIdentifier, target.ItemDefinitionId).input('routeId', sql.UniqueIdentifier, target.RouteDefinitionId)
+        .input('serial', sql.NVarChar(100), serialNumber).input('stepId', sql.UniqueIdentifier, target.FirstStepId)
+        .input('unitNumber', sql.Int, unitNumber).input('batchQuantity', sql.Int, plannedQuantity)
+        .query(`INSERT INTO production.WorkItems
+          (Id,ProjectId,ItemDefinitionId,RouteDefinitionId,SerialNumber,CurrentRouteStepId,CurrentStatus,UnitNumber,BatchQuantity)
+          VALUES (@id,@projectId,@itemId,@routeId,@serial,@stepId,'READY',@unitNumber,@batchQuantity);`);
+      await new sql.Request(transaction)
+        .input('id', sql.UniqueIdentifier, randomUUID()).input('workItemId', sql.UniqueIdentifier, workItemId)
+        .input('barcode', sql.NVarChar(160), barcode).input('userId', sql.UniqueIdentifier, identity.UserId)
+        .query(`INSERT INTO production.Barcodes (Id,WorkItemId,BarcodeValue,IssuedByUserId)
+          VALUES (@id,@workItemId,@barcode,@userId);`);
+      await new sql.Request(transaction).input('workItemId', sql.UniqueIdentifier, workItemId).input('stepId', sql.UniqueIdentifier, target.FirstStepId)
+        .query(`INSERT INTO production.StepExecutions (WorkItemId,RouteStepId,Status) VALUES (@workItemId,@stepId,'READY');`);
+      }
+      await enqueueEvent(new sql.Request(transaction), 'ENGINEERING_RELEASED_TO_PRODUCTION', 'PROJECT', projectId, {
+        projectId, projectName: projectRow.ProjectName, drawingNumber: projectRow.MainDrawingNumber,
+        quantity: plannedQuantity, firstSet: projectSets[0].name,
+      });
+    }
     await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, projectId)
-      .query('UPDATE core.Projects SET UpdatedAtUtc = SYSUTCDATETIME() WHERE Id = @projectId;');
+      .input('release', sql.Bit, releaseToProduction)
+      .query("UPDATE core.Projects SET Status=CASE WHEN @release=1 THEN 'ACTIVE' ELSE Status END, UpdatedAtUtc=SYSUTCDATETIME() WHERE Id=@projectId;");
     await new sql.Request(transaction)
       .input('userId', sql.UniqueIdentifier, identity.UserId).input('roleId', sql.UniqueIdentifier, identity.RoleId)
       .input('correlationId', sql.UniqueIdentifier, randomUUID()).input('entityId', sql.NVarChar(100), projectId)
@@ -377,7 +557,7 @@ export async function replaceProjectRoute(projectId, projectSets, actor) {
       .query(`INSERT INTO ops.AuditLogs (ActorUserId, ActorRoleId, EventType, EntityType, EntityId, CorrelationId, AfterJson)
               VALUES (@userId, @roleId, 'PROJECT_ROUTE_REPLACED', 'PROJECT', @entityId, @correlationId, @after);`);
     await transaction.commit();
-    return (await listProjects(projectId))[0];
+    return { ...(await listProjects(projectId))[0], releasedQuantity: releaseToProduction ? plannedQuantity : 0 };
   } catch (error) {
     await transaction.rollback().catch(() => {});
     throw error;
@@ -401,14 +581,24 @@ export async function issueWorkItem(input, actor) {
         ORDER BY Items.SetOrder, Routes.VersionNumber DESC;`);
     if (!route.recordset.length) { const error = new Error('SET_ROUTE_NOT_FOUND'); error.statusCode = 404; throw error; }
     if (!route.recordset[0].FirstStepId) { const error = new Error('SET_ROUTE_EMPTY'); error.statusCode = 422; throw error; }
+    const ordinal = await new sql.Request(transaction).input('projectId', sql.UniqueIdentifier, input.projectId).query(`
+      SELECT COUNT_BIG(*)+1 AS UnitNumber,
+        TRY_CONVERT(INT,JSON_VALUE(Profiles.ProfileJson,'$.plannedQuantity')) AS BatchQuantity
+      FROM core.Projects Projects
+      LEFT JOIN core.ProjectProfiles Profiles ON Profiles.ProjectId=Projects.Id
+      LEFT JOIN production.WorkItems WorkItems ON WorkItems.ProjectId=Projects.Id
+      WHERE Projects.Id=@projectId GROUP BY Profiles.ProfileJson;`);
+    const unitNumber = Number(ordinal.recordset[0]?.UnitNumber || 1);
+    const batchQuantity = Math.max(unitNumber, Number(ordinal.recordset[0]?.BatchQuantity || unitNumber));
     const workItemId = randomUUID();
     await new sql.Request(transaction)
       .input('id', sql.UniqueIdentifier, workItemId).input('projectId', sql.UniqueIdentifier, input.projectId)
       .input('itemId', sql.UniqueIdentifier, route.recordset[0].ItemDefinitionId)
       .input('routeId', sql.UniqueIdentifier, route.recordset[0].RouteDefinitionId)
       .input('serial', sql.NVarChar(100), input.serialNumber).input('stepId', sql.UniqueIdentifier, route.recordset[0].FirstStepId)
-      .query(`INSERT INTO production.WorkItems (Id, ProjectId, ItemDefinitionId, RouteDefinitionId, SerialNumber, CurrentRouteStepId, CurrentStatus)
-              VALUES (@id, @projectId, @itemId, @routeId, @serial, @stepId, 'READY');`);
+      .input('unitNumber', sql.Int, unitNumber).input('batchQuantity', sql.Int, batchQuantity)
+      .query(`INSERT INTO production.WorkItems (Id, ProjectId, ItemDefinitionId, RouteDefinitionId, SerialNumber, CurrentRouteStepId, CurrentStatus,UnitNumber,BatchQuantity)
+              VALUES (@id, @projectId, @itemId, @routeId, @serial, @stepId, 'READY',@unitNumber,@batchQuantity);`);
     const barcodeId = randomUUID();
     await new sql.Request(transaction)
       .input('id', sql.UniqueIdentifier, barcodeId).input('workItemId', sql.UniqueIdentifier, workItemId)
@@ -435,7 +625,7 @@ export async function issueWorkItem(input, actor) {
 export async function listProjectWorkItems(projectId) {
   const pool = await databasePool();
   const result = await pool.request().input('projectId', sql.UniqueIdentifier, projectId).query(`
-    SELECT WorkItems.Id, WorkItems.SerialNumber, WorkItems.CurrentStatus, WorkItems.CreatedAtUtc,
+    SELECT WorkItems.Id, WorkItems.SerialNumber, WorkItems.UnitNumber,WorkItems.BatchQuantity,WorkItems.CurrentStatus, WorkItems.CreatedAtUtc,
       WorkItems.CompletedAtUtc, Barcodes.BarcodeValue, Barcodes.IssuedAtUtc,
       Items.ItemName AS CurrentSetName, Steps.StepName AS CurrentStepName
     FROM production.WorkItems WorkItems
@@ -447,7 +637,7 @@ export async function listProjectWorkItems(projectId) {
     ORDER BY Barcodes.IssuedAtUtc DESC;
   `);
   return result.recordset.map((row) => ({
-    id: String(row.Id), serialNumber: row.SerialNumber, barcode: row.BarcodeValue,
+    id: String(row.Id), serialNumber: row.SerialNumber, unitNumber: Number(row.UnitNumber), totalQuantity: Number(row.BatchQuantity), barcode: row.BarcodeValue,
     status: row.CurrentStatus, currentSet: row.CurrentSetName || null, currentStep: row.CurrentStepName || null,
     issuedAt: row.IssuedAtUtc, completedAt: row.CompletedAtUtc || null,
   }));
@@ -462,12 +652,17 @@ function actionFor(context, actor) {
   if (actor.role === 'qc') return context.ExecutionStatus === 'WAITING_QC'
     ? { allowed: true, code: 'QC_APPROVE', title: 'تأیید کنترل کیفیت' }
     : { allowed: false, reason: 'QC_NOT_READY' };
-  if (actor.role === 'production' || actor.role === 'operator' || actor.role === 'packaging') {
+  if (actor.role === 'operator' || actor.role === 'packaging') {
     if (!actor.scope) return { allowed: false, reason: 'PRODUCTION_STATION_REQUIRED' };
     if (actor.accountRole !== 'admin' && stationKey(actor.scope) !== stationKey(context.OperatorRoleKey)) return { allowed: false, reason: 'PRODUCTION_STATION_MISMATCH' };
-    if (['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)) return { allowed: true, code: 'PRODUCTION_OPERATION_COMPLETE', title: `ثبت اتمام «${context.SetName}» توسط کنترل تولید` };
-    if (context.ExecutionStatus === 'WAITING_PRODUCTION_CONTROL') return { allowed: true, code: 'PRODUCTION_APPROVE', title: 'تأیید نهایی کنترل تولید' };
-    return { allowed: false, reason: 'PRODUCTION_CONTROL_NOT_READY' };
+    return ['READY', 'IN_PROGRESS'].includes(context.ExecutionStatus)
+      ? { allowed: true, code: 'PRODUCTION_OPERATION_COMPLETE', title: `ثبت اتمام «${context.SetName}» توسط اپراتور تولید` }
+      : { allowed: false, reason: 'STEP_NOT_READY' };
+  }
+  if (actor.role === 'production') {
+    return context.ExecutionStatus === 'WAITING_PRODUCTION_CONTROL'
+      ? { allowed: true, code: 'PRODUCTION_APPROVE', title: 'تأیید نهایی کنترل تولید' }
+      : { allowed: false, reason: 'PRODUCTION_CONTROL_NOT_READY' };
   }
   return { allowed: false, reason: 'ROLE_CANNOT_SCAN' };
 }
@@ -533,6 +728,33 @@ export async function resolveBarcode(code, actor) {
   return publicScanContext(row, actionFor(row, actor), processes);
 }
 
+export async function listAlerts(actor) {
+  const pool = await databasePool();
+  const status = actor.role === 'qc' ? 'WAITING_QC' : actor.role === 'production' ? 'WAITING_PRODUCTION_CONTROL' : 'READY';
+  const request = pool.request().input('status', sql.VarChar(40), status);
+  let stationFilter = '';
+  if (actor.role === 'operator' && actor.accountRole !== 'admin') {
+    request.input('station', sql.NVarChar(120), actor.scope || '');
+    stationFilter = 'AND Items.OperatorRoleKey=@station';
+  }
+  const result = await request.query(`SELECT TOP (100)
+      WorkItems.Id,WorkItems.UnitNumber,WorkItems.BatchQuantity,WorkItems.SerialNumber,WorkItems.CurrentStatus,
+      Projects.Id AS ProjectId,Projects.ProjectCode,Projects.ProjectName,
+      Items.ItemName AS SetName,Items.OperatorRoleKey,Steps.StepName,Executions.Status,Executions.RowVersion
+    FROM production.StepExecutions Executions
+    JOIN production.WorkItems WorkItems ON WorkItems.Id=Executions.WorkItemId AND WorkItems.CurrentRouteStepId=Executions.RouteStepId
+    JOIN core.Projects Projects ON Projects.Id=WorkItems.ProjectId AND Projects.Status='ACTIVE'
+    JOIN engineering.ItemDefinitions Items ON Items.Id=WorkItems.ItemDefinitionId
+    JOIN engineering.RouteSteps Steps ON Steps.Id=Executions.RouteStepId
+    WHERE Executions.Status=@status ${stationFilter}
+    ORDER BY WorkItems.CreatedAtUtc,WorkItems.UnitNumber;`);
+  return result.recordset.map((row) => ({
+    id: String(row.Id), projectId: String(row.ProjectId), projectCode: row.ProjectCode, projectName: row.ProjectName,
+    setName: row.SetName, stepName: row.StepName, serialNumber: row.SerialNumber,
+    unitNumber: Number(row.UnitNumber), totalQuantity: Number(row.BatchQuantity), status: row.Status,
+  }));
+}
+
 async function ensureScanSession(request, identity, actor) {
   const stationCode = String(actor.scope || roleCodes[actor.role] || 'UNASSIGNED').slice(0, 60);
   const stationType = String(roleCodes[actor.role] || 'OPERATOR').slice(0, 40);
@@ -577,13 +799,21 @@ export async function confirmBarcode(input, actor) {
     if (!action.allowed) { const error = new Error(action.reason); error.statusCode = 409; throw error; }
     const scanSessionId = await ensureScanSession(new sql.Request(transaction), identity, actor);
     if (action.code === 'PRODUCTION_OPERATION_COMPLETE') {
-      const nextStatus = row.RequiresQcApproval ? 'WAITING_QC' : row.RequiresProductionControl ? 'WAITING_PRODUCTION_CONTROL' : 'COMPLETED';
+      const nextStatus = 'WAITING_QC';
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId).input('status', sql.VarChar(40), nextStatus)
-        .query(`UPDATE production.StepExecutions SET Status=@status, ProductionOperationCompletedAtUtc=SYSUTCDATETIME(), StartedAtUtc=COALESCE(StartedAtUtc,SYSUTCDATETIME()) WHERE Id=@executionId;`);
+        .query(`UPDATE production.StepExecutions SET Status=@status, OperatorCompletedAtUtc=SYSUTCDATETIME(), StartedAtUtc=COALESCE(StartedAtUtc,SYSUTCDATETIME()) WHERE Id=@executionId;`);
+      await enqueueEvent(new sql.Request(transaction), 'QC_APPROVAL_REQUIRED', 'WORK_ITEM', row.WorkItemId, {
+        workItemId: String(row.WorkItemId), projectId: String(row.ProjectId), projectName: row.ProjectName,
+        setName: row.SetName, serialNumber: row.SerialNumber,
+      });
     } else if (action.code === 'QC_APPROVE') {
-      const nextStatus = row.RequiresProductionControl ? 'WAITING_PRODUCTION_CONTROL' : 'COMPLETED';
+      const nextStatus = 'WAITING_PRODUCTION_CONTROL';
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId).input('status', sql.VarChar(40), nextStatus)
         .query(`UPDATE production.StepExecutions SET Status=@status, QcCompletedAtUtc=SYSUTCDATETIME() WHERE Id=@executionId;`);
+      await enqueueEvent(new sql.Request(transaction), 'PRODUCTION_CONTROL_APPROVAL_REQUIRED', 'WORK_ITEM', row.WorkItemId, {
+        workItemId: String(row.WorkItemId), projectId: String(row.ProjectId), projectName: row.ProjectName,
+        setName: row.SetName, serialNumber: row.SerialNumber,
+      });
     } else if (action.code === 'PRODUCTION_APPROVE') {
       await new sql.Request(transaction).input('executionId', sql.UniqueIdentifier, row.StepExecutionId)
         .query(`UPDATE production.StepExecutions SET Status='COMPLETED', ProductionControlCompletedAtUtc=SYSUTCDATETIME() WHERE Id=@executionId;`);

@@ -5,7 +5,7 @@ import { createServer as createHttpsServer } from 'node:https';
 import { createHmac, randomBytes, randomUUID, scryptSync, timingSafeEqual } from 'node:crypto';
 import { extname, join, normalize } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { archiveProject as archiveDatabaseProject, confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, issueWorkItem, listProjects, listProjectWorkItems, replaceProjectRoute, resolveBarcode, saveProjectProfile as saveDatabaseProjectProfile } from './database.mjs';
+import { archiveProject as archiveDatabaseProject, confirmBarcode, createProject as createDatabaseProject, databaseConfigured, databaseHealth, deleteProject as deleteDatabaseProject, listAlerts, listProjects, listProjectWorkItems, replaceProjectRoute, resolveBarcode, saveProjectBaseProfile, saveProjectProfile as saveDatabaseProjectProfile } from './database.mjs';
 
 const appRoot = fileURLToPath(new URL('.', import.meta.url));
 const root = join(appRoot, 'dist');
@@ -52,13 +52,12 @@ function authUsers(config) {
   if (Array.isArray(config.users)) return config.users
     .filter((user) => user && user.username && (user.password || user.passwordHash) && user.role)
     .map((user) => {
-      if (!['operator', 'packaging'].includes(user.role)) return user;
+      if (user.role !== 'packaging') return user;
       return {
         ...user,
-        role: 'production',
-        scope: user.scope || (user.role === 'packaging' ? 'بسته‌بندی' : null),
-        permissions: [...new Set([...(Array.isArray(user.permissions) ? user.permissions : []), 'scanner', 'production_control'])]
-          .filter((permission) => permission !== 'packaging'),
+        role: 'operator', scope: user.scope || 'بسته‌بندی',
+        permissions: [...new Set([...(Array.isArray(user.permissions) ? user.permissions : []), 'scanner'])]
+          .filter((permission) => !['packaging', 'production_control'].includes(permission)),
       };
     });
   if (config.username && config.password) return [{ username: config.username, password: config.password, displayName: 'کاربر مهندسی', role: 'engineering' }];
@@ -83,8 +82,8 @@ function passwordMatches(user, password) {
 
 const permissionCatalog = new Set(['projects', 'project_create', 'engineering', 'production_flow', 'scanner', 'qc', 'production_control', 'packaging', 'access_matrix']);
 const rolePermissionDefaults = {
-  operator: ['scanner', 'production_control'], qc: ['projects', 'scanner', 'qc'], production: ['scanner', 'production_control'],
-  packaging: ['scanner', 'packaging'], engineering: ['projects', 'engineering'],
+  operator: ['scanner'], qc: ['projects', 'scanner', 'qc'], production: ['scanner', 'production_control'],
+  packaging: ['scanner', 'packaging'], planning: ['projects', 'project_create'], engineering: ['projects', 'engineering'],
   admin: [...permissionCatalog],
 };
 
@@ -133,13 +132,13 @@ function validSession(req, config) {
   return { username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || null, permissions: permissionsFor(user) };
 }
 
-const delegatedAdminRoles = new Set(['engineering', 'qc', 'production']);
+const delegatedAdminRoles = new Set(['planning', 'engineering', 'operator', 'qc', 'production']);
 
 function requestActor(session, req) {
   if (session.role !== 'admin') return session;
   const requestedRole = String(req.headers['x-wpmes-role'] || 'engineering').toLowerCase();
   const role = delegatedAdminRoles.has(requestedRole) ? requestedRole : 'engineering';
-  return { ...session, role, accountRole: 'admin', scope: role === 'production' ? '*' : session.scope, permissions: [...permissionCatalog] };
+  return { ...session, role, accountRole: 'admin', scope: role === 'operator' ? '*' : null, permissions: [...permissionCatalog] };
 }
 
 function renderLogin(res, invalid = false) {
@@ -229,7 +228,7 @@ function validProjectSet(input) {
 function defaultAssemblySets() {
   return [
     ['MONTAGE', 'مونتاژ'], ['WELDING', 'جوش'], ['SANDBLAST', 'سندبلاست'],
-    ['INTERMEDIATE-PAINT', 'رنگ میانی'], ['FINAL-PAINT', 'رنگ نهایی'], ['PACKAGING', 'بسته‌بندی'],
+    ['INTERMEDIATE-PAINT', 'رنگ میانی'], ['FINAL-PAINT', 'رنگ نهایی'], ['PACKAGING-DELIVERY', 'بسته‌بندی و تحویل'],
   ].map(([code, name]) => ({
     id: randomUUID(), name, code, kind: 'assembly', operatorRole: name,
     steps: [{ id: randomUUID(), name, execution: 'internal', qcRequired: true, productionControlRequired: true, barcodeAfter: false }],
@@ -247,15 +246,34 @@ function normalizeProjectProfile(input) {
   const customSource = input.customFields && typeof input.customFields === 'object' && !Array.isArray(input.customFields) ? input.customFields : {};
   const customFields = Object.fromEntries(Object.entries(customSource).slice(0, 60).map(([key, value]) => [String(key).trim().slice(0, 80), String(value ?? '').trim().slice(0, 500)]).filter(([key]) => key));
   return {
+    itemType: input.itemType === 'single' ? 'single' : input.itemType === 'assembly' ? 'assembly' : null,
+    plannedQuantity: Number(input.plannedQuantity),
+    dimension: String(input.dimension || '').trim().slice(0, 200),
+    weight: String(input.weight || '').trim().slice(0, 100),
+    description: String(input.description || '').trim().slice(0, 2000),
     mainDrawingNumber: String(input.mainDrawingNumber || '').trim().slice(0, 100), componentDrawings,
     customFields,
     importedHeaders, importedRows, sourceFileName: String(input.sourceFileName || '').trim().slice(0, 260),
   };
 }
 
+function normalizeBaseProfile(input) {
+  if (!input || typeof input.name !== 'string' || typeof input.code !== 'string' || typeof input.clientName !== 'string' || typeof input.orderNumber !== 'string') return null;
+  const base = {
+    name: input.name.trim().slice(0, 220), code: input.code.trim().slice(0, 60),
+    clientName: input.clientName.trim().slice(0, 220), orderNumber: input.orderNumber.trim().slice(0, 100),
+  };
+  return Object.values(base).every((value) => value.length >= 2) ? base : null;
+}
+
 async function handleApi(req, res, pathname) {
   if (pathname === '/api/auth/session' && req.method === 'GET') {
     sendJson(res, 200, { user: req.authUser });
+    return true;
+  }
+  if (pathname === '/api/alerts' && req.method === 'GET') {
+    if (!databaseConfigured() || !['operator', 'qc', 'production'].includes(req.authUser.role)) { sendJson(res, 200, { alerts: [] }); return true; }
+    sendJson(res, 200, { alerts: await listAlerts(req.authUser) });
     return true;
   }
   if (pathname === '/api/admin/access-matrix' && req.method === 'GET') {
@@ -274,7 +292,7 @@ async function handleApi(req, res, pathname) {
     if (!input || !Array.isArray(input.users) || input.users.length > 200) { sendJson(res, 422, { error: 'ماتریس دسترسی معتبر نیست.' }); return true; }
     const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
     const updates = new Map(input.users.map((user) => [String(user?.username || ''), user]));
-    const validRoles = new Set(['qc', 'production', 'engineering', 'admin']);
+    const validRoles = new Set(['planning', 'operator', 'qc', 'production', 'engineering', 'admin']);
     config.users = authUsers(config).map((user) => {
       const update = updates.get(user.username);
       if (!update || user.role === 'admin') return user;
@@ -282,7 +300,7 @@ async function handleApi(req, res, pathname) {
       const permissions = Array.isArray(update.permissions)
         ? [...new Set(update.permissions.map((value) => String(value)).filter((value) => permissionCatalog.has(value) && value !== 'access_matrix'))]
         : permissionsFor(user);
-      return { ...user, role, scope: role === 'production' ? String(update.scope || '').trim() || null : null, permissions };
+      return { ...user, role, scope: role === 'operator' ? String(update.scope || '').trim() || null : null, permissions };
     });
     await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
     sendJson(res, 200, { users: config.users.map((user) => ({ username: user.username, displayName: user.displayName || user.username, role: user.role, scope: user.scope || '', permissions: permissionsFor(user), isAdmin: user.role === 'admin' })) });
@@ -296,14 +314,14 @@ async function handleApi(req, res, pathname) {
     const role = String(input?.role || 'production');
     const scope = String(input?.scope || '').trim().slice(0, 120);
     const password = String(input?.password || '');
-    const validRoles = new Set(['qc', 'production', 'engineering']);
-    if (!/^[a-z0-9._-]{3,60}$/.test(username) || displayName.length < 2 || !validRoles.has(role) || password.length < 10 || (role === 'production' && scope.length < 2)) {
-      sendJson(res, 422, { error: role === 'production' ? 'برای کنترل تولید، انتخاب مجموعه مسئول الزامی است.' : 'نام، نام کاربری انگلیسی، نقش و رمز حداقل ۱۰ کاراکتری الزامی است.' }); return true;
+    const validRoles = new Set(['planning', 'operator', 'qc', 'production', 'engineering']);
+    if (!/^[a-z0-9._-]{3,60}$/.test(username) || displayName.length < 2 || !validRoles.has(role) || password.length < 10 || (role === 'operator' && scope.length < 2)) {
+      sendJson(res, 422, { error: role === 'operator' ? 'برای اپراتور تولید، انتخاب مجموعه مسئول الزامی است.' : 'نام، نام کاربری انگلیسی، نقش و رمز حداقل ۱۰ کاراکتری الزامی است.' }); return true;
     }
     const config = JSON.parse(readFileSync(publicAuthPath, 'utf8'));
     const users = authUsers(config);
     if (users.some((user) => user.username.toLowerCase() === username)) { sendJson(res, 409, { error: 'این نام کاربری قبلاً ثبت شده است.' }); return true; }
-    const user = { username, displayName, role, scope: role === 'production' ? scope : null, permissions: rolePermissionDefaults[role] || [], passwordHash: passwordHash(password) };
+    const user = { username, displayName, role, scope: role === 'operator' ? scope : null, permissions: rolePermissionDefaults[role] || [], passwordHash: passwordHash(password) };
     config.users = [...users, user];
     await writeFile(publicAuthPath, JSON.stringify(config, null, 2), { encoding: 'utf8', mode: 0o600 });
     sendJson(res, 201, { user: { username, displayName, role, scope: user.scope || '', permissions: user.permissions, isAdmin: false } });
@@ -370,26 +388,22 @@ async function handleApi(req, res, pathname) {
   if (pathname === '/api/projects' && req.method === 'POST') {
     if (!hasPermission(req.authUser, 'project_create')) { sendJson(res, 403, { error: 'دسترسی تعریف پروژه برای این کاربر فعال نیست.' }); return true; }
     const input = await readJson(req);
-    if (!input || typeof input.name !== 'string' || input.name.trim().length < 2 || typeof input.code !== 'string' || input.code.trim().length < 2 || !['single', 'assembly'].includes(input.itemType)) {
-      sendJson(res, 422, { error: 'نام، کد و نوع پروژه الزامی است.' }); return true;
+    if (!input || typeof input.name !== 'string' || input.name.trim().length < 2 || typeof input.code !== 'string' || input.code.trim().length < 2) {
+      sendJson(res, 422, { error: 'نام و کد پروژه الزامی است.' }); return true;
     }
-    const sets = input.itemType === 'assembly' ? defaultAssemblySets() : [];
     const normalized = {
-      name: input.name.trim(), code: input.code.trim(), itemType: input.itemType,
-      drawings: input.itemType === 'single' && Array.isArray(input.drawings) ? input.drawings.map((value) => String(value).trim()).filter(Boolean).slice(0, 100) : [],
-      sets,
+      name: input.name.trim(), code: input.code.trim(), itemType: null, drawings: [], sets: [],
     };
     if (databaseConfigured()) {
       const created = await createDatabaseProject(normalized, req.authUser);
-      const project = sets.length ? await replaceProjectRoute(created.id, sets, req.authUser) : created;
+      const project = await replaceProjectRoute(created.id, defaultAssemblySets(), req.authUser, false);
       sendJson(res, 201, { project });
       return true;
     }
     const state = await loadState();
     const project = {
       id: randomUUID(), ...normalized,
-      sets,
-      profile: input.itemType === 'assembly' ? { mainDrawingNumber: '', componentDrawings: [], customFields: {}, importedHeaders: [], importedRows: [], sourceFileName: '', importedRowCount: 0 } : null,
+      sets: defaultAssemblySets(), profile: null,
       createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
     };
     state.projects.push(project);
@@ -397,11 +411,21 @@ async function handleApi(req, res, pathname) {
     sendJson(res, 201, { project });
     return true;
   }
-  if (pathname.startsWith('/api/projects/') && pathname.endsWith('/profile') && req.method === 'PUT') {
+  if (pathname.startsWith('/api/projects/') && pathname.endsWith('/profile/base') && req.method === 'PUT') {
+    if (!hasPermission(req.authUser, 'project_create')) { sendJson(res, 403, { error: 'تکمیل اطلاعات پایه فقط در اختیار امور برنامه‌ریزی است.' }); return true; }
+    const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/profile/base'.length));
+    const base = normalizeBaseProfile(await readJson(req));
+    if (!base) { sendJson(res, 422, { error: 'نام پروژه، شماره پروژه، کارفرما و شماره سفارش الزامی است.' }); return true; }
+    if (!databaseConfigured()) { sendJson(res, 503, { error: 'پایگاه داده تولید فعال نیست.' }); return true; }
+    const project = await saveProjectBaseProfile(id, base, req.authUser);
+    sendJson(res, 200, { project }); return true;
+  }
+  if (pathname.startsWith('/api/projects/') && (pathname.endsWith('/profile/technical') || pathname.endsWith('/profile')) && req.method === 'PUT') {
     if (!hasPermission(req.authUser, 'engineering')) { sendJson(res, 403, { error: 'ویرایش پروفایل فقط در اختیار امور مهندسی است.' }); return true; }
-    const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/profile'.length));
+    const suffix = pathname.endsWith('/profile/technical') ? '/profile/technical' : '/profile';
+    const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -suffix.length));
     const profile = normalizeProjectProfile(await readJson(req));
-    if (!profile) { sendJson(res, 422, { error: 'اطلاعات پروفایل پروژه معتبر نیست.' }); return true; }
+    if (!profile || !profile.itemType || !profile.mainDrawingNumber || !Number.isInteger(profile.plannedQuantity) || profile.plannedQuantity < 1 || profile.plannedQuantity > 10000) { sendJson(res, 422, { error: 'نوع محصول، شماره نقشه اصلی و تعداد تولید معتبر الزامی است.' }); return true; }
     if (databaseConfigured()) {
       const project = await saveDatabaseProjectProfile(id, profile, req.authUser);
       sendJson(res, 200, { project }); return true;
@@ -409,9 +433,8 @@ async function handleApi(req, res, pathname) {
     const state = await loadState();
     const index = state.projects.findIndex((project) => project.id === id);
     if (index < 0) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
-    if (state.projects[index].itemType !== 'assembly') { sendJson(res, 409, { error: 'پروفایل مونتاژی فقط برای Assembly Part فعال است.' }); return true; }
     const drawings = [...new Set([profile.mainDrawingNumber, ...profile.componentDrawings.map((item) => item.drawingNumber)].filter(Boolean))];
-    state.projects[index] = { ...state.projects[index], profile: { ...profile, importedRowCount: profile.importedRows.length, updatedAt: new Date().toISOString() }, drawings, updatedAt: new Date().toISOString() };
+    state.projects[index] = { ...state.projects[index], itemType: profile.itemType, profile: { ...profile, importedRowCount: profile.importedRows.length, updatedAt: new Date().toISOString() }, drawings, updatedAt: new Date().toISOString() };
     await saveState(state);
     sendJson(res, 200, { project: state.projects[index] }); return true;
   }
@@ -419,7 +442,7 @@ async function handleApi(req, res, pathname) {
     if (!hasPermission(req.authUser, 'engineering')) { sendJson(res, 403, { error: 'دسترسی مهندسی برای این کاربر فعال نیست.' }); return true; }
     const id = decodeURIComponent(pathname.slice('/api/projects/'.length, -'/route'.length));
     const input = await readJson(req);
-    if (!input || !Array.isArray(input.sets) || input.sets.length > 100 || !input.sets.every(validProjectSet)) {
+    if (!input || !Array.isArray(input.sets) || input.sets.length < 1 || input.sets.length > 100 || !input.sets.every((set) => validProjectSet(set) && set.steps.length > 0)) {
       sendJson(res, 422, { error: 'چینش مجموعه‌های پروژه کامل نیست.' }); return true;
     }
     const normalizedSets = input.sets.map((set) => ({
@@ -496,16 +519,9 @@ async function handleApi(req, res, pathname) {
     if (!input || typeof input.projectId !== 'string' || typeof input.serialNumber !== 'string' || input.serialNumber.trim().length < 2) {
       sendJson(res, 422, { error: 'پروژه و شماره سریال الزامی است.' }); return true;
     }
-    let project = (await listProjects(input.projectId))[0];
+    const project = (await listProjects(input.projectId))[0];
     if (!project) { sendJson(res, 404, { error: 'پروژه پیدا نشد.' }); return true; }
-    let routeInitialized = false;
-    if (project.itemType === 'assembly' && !project.sets.length) {
-      project = await replaceProjectRoute(project.id, defaultAssemblySets(), req.authUser);
-      routeInitialized = true;
-    }
-    const barcode = `WPMES-${Date.now().toString(36)}-${randomBytes(5).toString('hex')}`.toUpperCase();
-    const item = await issueWorkItem({ projectId: input.projectId, serialNumber: input.serialNumber.trim(), barcode }, req.authUser);
-    sendJson(res, 201, { item, project, routeInitialized });
+    sendJson(res, 409, { error: 'QR محصولات هنگام ثبت نهایی اطلاعات مهندسی و به تعداد برنامه‌ریزی‌شده، خودکار صادر می‌شود.' });
     return true;
   }
   if (pathname === '/api/scan/confirm' && req.method === 'POST') {
@@ -565,16 +581,19 @@ async function handle(req, res, isTls) {
   } catch (error) {
     const status = error?.message === 'PAYLOAD_TOO_LARGE' ? 413 : Number(error?.statusCode || (error?.number === 2601 || error?.number === 2627 ? 409 : 400));
     const scanErrors = {
-      BARCODE_NOT_FOUND: 'بارکد فعال پیدا نشد.', PRODUCTION_STATION_REQUIRED: 'برای حساب کنترل تولید، مجموعه مسئول تعیین نشده است.',
-      PRODUCTION_STATION_MISMATCH: 'این مجموعه در حوزه مسئولیت کنترل تولید نیست.', STEP_NOT_READY: 'این مرحله آماده ثبت کنترل تولید نیست.',
+      BARCODE_NOT_FOUND: 'بارکد فعال پیدا نشد.', PRODUCTION_STATION_REQUIRED: 'برای حساب اپراتور تولید، مجموعه مسئول تعیین نشده است.',
+      PRODUCTION_STATION_MISMATCH: 'این مجموعه در حوزه مسئولیت اپراتور تولید نیست.', STEP_NOT_READY: 'این مرحله آماده ثبت اپراتور تولید نیست.',
       QC_NOT_READY: 'قطعه هنوز در انتظار کنترل کیفیت نیست.', PRODUCTION_CONTROL_NOT_READY: 'قطعه هنوز در انتظار کنترل تولید نیست.',
       PACKAGING_NOT_READY: 'قطعه هنوز وارد مرحله پکیجینگ نشده است.', ROLE_CANNOT_SCAN: 'نقش فعلی مجوز ثبت عملیات اسکن را ندارد.',
       PROJECT_SCOPE_MISMATCH: 'این بارکد متعلق به پروژه انتخاب‌شده نیست.',
       SET_ROUTE_NOT_FOUND: 'مسیر مجموعه پیدا نشد.', SET_ROUTE_EMPTY: 'برای این مجموعه زیرفرآیندی تعریف نشده است.',
+      ROUTE_REQUIRES_STEPS: 'برای ورود به تولید، حداقل یک مجموعه و یک فرایند الزامی است.',
+      PROFILE_RELEASE_FIELDS_REQUIRED: 'ابتدا نوع محصول، شماره نقشه اصلی و تعداد تولید را در پروفایل مهندسی تکمیل کنید.',
+      BASE_PROFILE_REQUIRED: 'ابتدا امور برنامه‌ریزی باید اطلاعات پایه پروژه را تکمیل کند.', PRODUCT_TYPE_LOCKED: 'نوع محصول پس از ورود پروژه به تولید قابل تغییر نیست.',
+      BASE_PROFILE_LOCKED: 'اطلاعات پایه پروژه پس از ورود به تولید قفل می‌شود.', QUANTITY_REDUCTION_STARTED: 'کاهش تعداد فقط برای محصولاتی مجاز است که هنوز هیچ عملیاتی روی آن‌ها ثبت نشده باشد.',
     };
     const message = error?.message === 'ROUTE_ALREADY_IN_USE' ? 'این مسیر وارد تولید شده و باید با نسخه جدید اصلاح شود.' :
       error?.message === 'PROJECT_ALREADY_IN_PRODUCTION' ? 'این پروژه وارد چرخه تولید شده و برای حفظ سوابق قابل حذف نیست.' :
-      error?.message === 'PROFILE_ASSEMBLY_ONLY' ? 'پروفایل مونتاژی فقط برای Assembly Part فعال است.' :
       error?.message === 'PROJECT_NOT_FOUND' ? 'پروژه پیدا نشد.' : status === 409 ? 'کد واردشده قبلاً ثبت شده است.' : 'درخواست قابل پردازش نیست.';
     console.error('Request failed', { pathname, status, code: error?.code, number: error?.number, message: error?.message });
     sendJson(res, status, { error: scanErrors[error?.message] || message });
